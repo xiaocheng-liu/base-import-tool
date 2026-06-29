@@ -1,0 +1,110 @@
+name: Build Release
+
+on:
+  push:
+    branches: [main, master]
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  # ==================== Windows ====================
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: dtolnay/rust-toolchain@stable
+      - run: npm ci
+
+      - name: Check Oracle Instant Client (Windows)
+        shell: pwsh
+        run: |
+          $clientDir = "src-tauri\resources\oracle-client-windows"
+          if (Test-Path "$clientDir\oci.dll") {
+            Write-Host "✓ Oracle Instant Client (Windows) found"
+          } else {
+            Write-Host "::warning::Oracle client not found in $clientDir, Oracle DB won't work"
+          }
+
+      - run: npm run build
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          args: --target x86_64-pc-windows-msvc
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-msi
+          path: src-tauri/target/release/bundle/msi/*.msi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-nsis
+          path: src-tauri/target/release/bundle/nsis/*.exe
+
+  # ==================== macOS x86_64 ====================
+  build-macos-x64:
+    runs-on: macos-13
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: dtolnay/rust-toolchain@stable
+      - run: npm ci
+
+      - name: Check Oracle Instant Client (macOS)
+        run: |
+          if [ -f "src-tauri/resources/oracle-client-macos/libclntsh.dylib" ]; then
+            echo "✓ Oracle Instant Client (macOS) found"
+          else
+            echo "::warning::Oracle client not found, Oracle DB won't work"
+          fi
+
+      - run: npm run build
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          args: --target x86_64-apple-darwin
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-x64-dmg
+          path: src-tauri/target/release/bundle/dmg/*.dmg
+
+  # ==================== macOS ARM64 (Apple Silicon) ====================
+  build-macos-arm64:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      - run: npm ci
+
+      - name: Check Oracle Instant Client (macOS)
+        run: |
+          if [ -f "src-tauri/resources/oracle-client-macos/libclntsh.dylib" ]; then
+            echo "✓ Oracle Instant Client (macOS) found"
+          else
+            echo "::warning::Oracle client not found, Oracle DB won't work"
+          fi
+
+      - run: npm run build
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          args: --target aarch64-apple-darwin
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-arm64-dmg
+          path: src-tauri/target/release/bundle/dmg/*.dmg

@@ -1,0 +1,16 @@
+{
+  "identifier": "default",
+  "description": "默认权限",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "dialog:default",
+    "dialog:allow-open",
+    "dialog:allow-message",
+    "dialog:allow-ask",
+    "fs:default",
+    "fs:allow-read-text-file",
+    "fs:allow-read-dir",
+    "fs:allow-exists"
+  ]
+}

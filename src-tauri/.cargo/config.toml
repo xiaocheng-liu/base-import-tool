@@ -1,0 +1,6 @@
+[target.aarch64-apple-darwin]
+rustflags = ["-L", "/opt/homebrew/lib", "-C", "link-arg=-L/opt/homebrew/lib"]
+
+[env]
+SDKROOT = { value = "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk", force = true }
+LIBRARY_PATH = { value = "/opt/homebrew/lib", force = true }

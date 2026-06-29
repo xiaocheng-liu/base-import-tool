@@ -1,0 +1,19 @@
+Basic Package Information
+=========================
+
+Tue Apr 29 04:48:40 PDT 2025
+
+Client Shared Library 64-bit - 23.3.0.23.09
+
+System name:	Darwin
+Release:	22.3.0
+Version:	Darwin Kernel Version 22.3.0: Mon Jan 30 20:39:35 PST 2023; root:xnu-8792.81.3~2/RELEASE_ARM64_T8103
+Machine:	arm64
+
+TIMEZONE INFORMATION
+--------------------
+Operating in ORACLE_HOME environment.
+
+Small timezone file = timezone_43.dat
+Large timezone file = timezlrg_43.dat
+
