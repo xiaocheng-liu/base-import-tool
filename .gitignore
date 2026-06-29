@@ -3,3 +3,13 @@ dist/
 src-tauri/target/
 *.log
 .DS_Store
+
+# Oracle 客户端库文件（太大，CI 自动下载）
+src-tauri/resources/oracle-client-macos/
+src-tauri/resources/oracle-client-windows/
+src-tauri/resources/oracle-client-linux/
+
+# 发布包（太大，通过 GitHub Releases 发布）
+release-for-implementation/*.dmg
+release-for-implementation/*.msi
+release-for-implementation/*.exe
