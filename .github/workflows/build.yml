@@ -59,6 +59,10 @@ jobs:
         with:
           node-version: 20
       - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system dependencies (macOS)
+        run: brew install unixodbc
+
       - run: npm ci
 
       - name: Download Oracle Instant Client (macOS x64)
@@ -95,6 +99,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin
+
+      - name: Install system dependencies (macOS)
+        run: brew install unixodbc
+
       - run: npm ci
 
       - name: Download Oracle Instant Client (macOS ARM64)
