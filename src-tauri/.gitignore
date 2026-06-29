@@ -2,3 +2,11 @@
 # will have compiled files and executables
 /target/
 /gen/schemas
+
+# Oracle Instant Client (downloaded by CI)
+/resources/oracle-client-macos/*
+/resources/oracle-client-windows/*
+/resources/oracle-client-linux/*
+!resources/oracle-client-macos/.gitkeep
+!resources/oracle-client-windows/.gitkeep
+!resources/oracle-client-linux/.gitkeep
