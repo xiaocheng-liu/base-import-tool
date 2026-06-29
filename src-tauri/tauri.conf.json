@@ -1,6 +1,6 @@
 {
   "$schema": "https://raw.githubusercontent.com/nicedoc/open-tauri/main/docs/.vitepress/public/tauri-v2.schema.json",
-  "productName": "数据库导入工具",
+  "productName": "base-import-tool",
   "version": "0.1.0",
   "identifier": "com.pdms.base-import-tool",
   "build": {
