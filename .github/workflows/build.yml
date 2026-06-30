@@ -15,10 +15,10 @@ jobs:
   # ==================== Windows ====================
   build-windows:
     runs-on: windows-latest
-    outputs:
-      artifact-name: ${{ steps.upload-msi.outputs.artifact-id }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
           node-version: 20
@@ -45,6 +45,8 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
+          tagName: ${{ github.ref_name }}
+          releaseName: ${{ github.ref_name }}
           args: --target x86_64-pc-windows-msvc
 
       - uses: actions/upload-artifact@v4
@@ -62,6 +64,8 @@ jobs:
     runs-on: macos-13
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
           node-version: 20
@@ -88,6 +92,8 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
+          tagName: ${{ github.ref_name }}
+          releaseName: ${{ github.ref_name }}
           args: --target x86_64-apple-darwin
 
       - uses: actions/upload-artifact@v4
@@ -100,6 +106,8 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
           node-version: 20
@@ -128,6 +136,8 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
+          tagName: ${{ github.ref_name }}
+          releaseName: ${{ github.ref_name }}
           args: --target aarch64-apple-darwin
 
       - uses: actions/upload-artifact@v4
