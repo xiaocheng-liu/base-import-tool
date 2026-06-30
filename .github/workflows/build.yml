@@ -28,6 +28,24 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: npm ci
 
+      - name: Sync version from Git tag
+        shell: pwsh
+        run: |
+          # 从 git tag 提取版本号（去掉 v 前缀），例如 v0.1.2 -> 0.1.2
+          $ver = '${{ github.ref_name }}' -replace '^v', ''
+
+          # 更新 tauri.conf.json
+          $tauriConf = Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json
+          $tauriConf.version = $ver
+          $tauriConf | ConvertTo-Json -Depth 10 | Set-Content src-tauri/tauri.conf.json -Encoding UTF8
+          Write-Host "tauri.conf.json version -> $ver"
+
+          # 更新 Cargo.toml
+          $cargo = Get-Content src-tauri/Cargo.toml -Raw
+          $cargo = $cargo -replace '^version\s*=\s*"[^"]*"', ('version = "' + $ver + '"')
+          Set-Content src-tauri/Cargo.toml -Value $cargo -Encoding UTF8
+          Write-Host "Cargo.toml version -> $ver"
+
       - name: Download Oracle Instant Client (Windows)
         uses: iamazeem/setup-oracle-instant-client-action@v2
         id: oracle-windows
@@ -79,6 +97,19 @@ jobs:
 
       - run: npm ci
 
+      - name: Sync version from Git tag
+        run: |
+          ver='${{ github.ref_name }}'
+          ver="${ver#v}"
+
+          # 更新 tauri.conf.json（macOS 自带 jq 或 perl）
+          perl -i -pe 's/"version"\s*:\s*"[^"]*"/"version": "'"$ver"'"/' src-tauri/tauri.conf.json
+          echo "tauri.conf.json version -> $ver"
+
+          # 更新 Cargo.toml
+          perl -i -pe 's/^version\s*=\s*"[^"]*"/version = "'"$ver"'"/' src-tauri/Cargo.toml
+          echo "Cargo.toml version -> $ver"
+
       - name: Download Oracle Instant Client (macOS x64)
         uses: iamazeem/setup-oracle-instant-client-action@v2
         id: oracle-macos-x64
@@ -122,6 +153,19 @@ jobs:
         run: brew install unixodbc
 
       - run: npm ci
+
+      - name: Sync version from Git tag
+        run: |
+          ver='${{ github.ref_name }}'
+          ver="${ver#v}"
+
+          # 更新 tauri.conf.json
+          perl -i -pe 's/"version"\s*:\s*"[^"]*"/"version": "'"$ver"'"/' src-tauri/tauri.conf.json
+          echo "tauri.conf.json version -> $ver"
+
+          # 更新 Cargo.toml
+          perl -i -pe 's/^version\s*=\s*"[^"]*"/version = "'"$ver"'"/' src-tauri/Cargo.toml
+          echo "Cargo.toml version -> $ver"
 
       - name: Download Oracle Instant Client (macOS ARM64)
         uses: iamazeem/setup-oracle-instant-client-action@v2
