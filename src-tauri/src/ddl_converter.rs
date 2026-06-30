@@ -1677,7 +1677,7 @@ fn estimate_fixed_column_bytes(mysql_type: &str) -> u32 {
 /// 将数据库中已有的列类型格式化为可读的大写字符串（带长度信息）
 fn format_existing_column_type(existing: &ColumnInfo) -> String {
     let upper = existing.data_type.to_uppercase();
-    let mut display = if let Some(len) = existing.data_length {
+    let display = if let Some(len) = existing.data_length {
         if len > 0 && (upper.starts_with("VARCHAR") || upper.starts_with("CHAR")) {
             format!("{}({})", upper, len)
         } else if upper.starts_with("TEXT") || upper.starts_with("BLOB") {
@@ -1860,6 +1860,7 @@ fn parse_number_precision(data_type: &str) -> Option<(u32, i32)> {
     Some((precision, scale))
 }
 
+#[allow(dead_code)]
 fn index_exists(expected: &IndexDef, existing_indexes: &[IndexInfo]) -> bool {
     existing_indexes.iter().any(|index| {
         index.name.eq_ignore_ascii_case(&expected.index_name)
