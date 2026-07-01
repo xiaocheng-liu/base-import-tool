@@ -21,6 +21,7 @@ fn loads_configs_after_save() {
         username: "kbe".to_string(),
         password: "secret".to_string(),
         database: "orclpdb".to_string(),
+        oracle_connection_mode: Default::default(),
         extra_params: String::new(),
     }];
 

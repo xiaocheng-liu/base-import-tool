@@ -146,6 +146,19 @@ pub struct CsvFileInfo {
     pub columns: Vec<String>,
 }
 
+/// Oracle 连接模式
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum OracleConnectionMode {
+    ServiceName,
+    SID,
+}
+
+impl Default for OracleConnectionMode {
+    fn default() -> Self {
+        OracleConnectionMode::ServiceName
+    }
+}
+
 /// 数据库连接配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DbConfig {
@@ -157,7 +170,9 @@ pub struct DbConfig {
     pub port: u16,
     pub username: String,
     pub password: String,
-    pub database: String,     // PG的数据库名 / Oracle的ServiceName / DM的schema
+    pub database: String,     // PG的数据库名 / Oracle的ServiceName或SID / DM的schema
+    #[serde(default)]
+    pub oracle_connection_mode: OracleConnectionMode,
     pub extra_params: String, // 额外连接参数
 }
 
@@ -189,6 +204,19 @@ pub enum ImportStatus {
     Skipped,
 }
 
+/// 单条 SQL 执行失败记录（用于前端逐条展示）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SqlErrorItem {
+    /// 第几条 SQL（从 1 开始）
+    pub index: usize,
+    /// 错误简述
+    pub error: String,
+    /// 完整的出错的 SQL 语句
+    pub sql: String,
+    /// 错误解决建议（可选）
+    pub suggestion: Option<String>,
+}
+
 /// 导入进度
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImportProgress {
@@ -197,6 +225,11 @@ pub struct ImportProgress {
     pub progress: f64,
     pub total_rows: usize,
     pub imported_rows: usize,
+    /// 失败 SQL 列表（按每条独立展示）
+    #[serde(default)]
+    pub errors: Vec<SqlErrorItem>,
+    /// 兼容旧字段：单字符串错误信息（由 `errors` 汇总得到）
+    #[serde(default)]
     pub error_message: Option<String>,
 }
 

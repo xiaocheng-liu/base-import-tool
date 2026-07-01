@@ -1,4 +1,4 @@
-use super::{DbConnection, DbValue};
+use super::{format_db_error, DbConnection, DbValue};
 use crate::models::{ColumnInfo, ConnectionTestResult, DbConfig, IndexInfo, TableIdentifier};
 use async_trait::async_trait;
 use sqlx::mysql::{MySqlPool, MySqlPoolOptions};
@@ -13,12 +13,12 @@ impl MySqlConnection {
     pub async fn new(config: &DbConfig) -> Result<Self, String> {
         let url = if config.database.is_empty() {
             format!(
-                "mysql://{}:{}@{}:{}",
+                "mysql://{}:{}@{}:{}/?connect_timeout=10",
                 config.username, config.password, config.host, config.port
             )
         } else {
             format!(
-                "mysql://{}:{}@{}:{}/{}",
+                "mysql://{}:{}@{}:{}/{}?connect_timeout=10",
                 config.username, config.password, config.host, config.port, config.database
             )
         };
@@ -27,13 +27,13 @@ impl MySqlConnection {
             .max_connections(5)
             .connect(&url)
             .await
-            .map_err(|e| format!("连接 MySQL 失败: {}", e))?;
+            .map_err(|e| format_db_error("连接 MySQL 失败", e))?;
 
         // 测试连接
         sqlx::query("SELECT 1")
             .execute(&pool)
             .await
-            .map_err(|e| format!("MySQL 测试查询失败: {}", e))?;
+            .map_err(|e| format_db_error("MySQL 测试查询失败", e))?;
 
         Ok(MySqlConnection { pool })
     }
@@ -114,7 +114,7 @@ impl DbConnection for MySqlConnection {
             query
                 .execute(&self.pool)
                 .await
-                .map_err(|e| format!("MySQL 插入数据失败: {}", e))?;
+                .map_err(|e| format_db_error("MySQL 插入数据失败", e))?;
             inserted += 1;
         }
 
@@ -129,7 +129,7 @@ impl DbConnection for MySqlConnection {
         .bind(table.table_name.to_lowercase())
         .fetch_one(&self.pool)
         .await
-        .map_err(|e| format!("MySQL 查询表存在性失败: {}", e))?;
+        .map_err(|e| format_db_error("MySQL 查询表存在性失败", e))?;
 
         let count: i64 = row.get("cnt");
         Ok(count > 0)
@@ -143,28 +143,28 @@ impl DbConnection for MySqlConnection {
         .bind(table.table_name.to_lowercase())
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| format!("MySQL 查询字段失败: {}", e))?;
+        .map_err(|e| format_db_error("MySQL 查询字段失败", e))?;
 
         rows.iter()
             .map(|row| {
                 Ok(ColumnInfo {
                     name: row
                         .try_get::<String, _>("column_name")
-                        .map_err(|e| format!("MySQL 读取字段名失败: {}", e))?,
+                        .map_err(|e| format_db_error("MySQL 读取字段名失败", e))?,
                     data_type: row
                         .try_get::<String, _>("data_type")
-                        .map_err(|e| format!("MySQL 读取字段类型失败: {}", e))?,
+                        .map_err(|e| format_db_error("MySQL 读取字段类型失败", e))?,
                     data_length: row
                         .try_get::<Option<i64>, _>("data_length")
-                        .map_err(|e| format!("MySQL 读取字段长度失败: {}", e))?
+                        .map_err(|e| format_db_error("MySQL 读取字段长度失败", e))?
                         .map(|v| v as u32),
                     data_precision: row
                         .try_get::<Option<i64>, _>("data_precision")
-                        .map_err(|e| format!("MySQL 读取字段精度失败: {}", e))?
+                        .map_err(|e| format_db_error("MySQL 读取字段精度失败", e))?
                         .map(|v| v as u32),
                     data_scale: row
                         .try_get::<Option<i64>, _>("data_scale")
-                        .map_err(|e| format!("MySQL 读取字段小数位失败: {}", e))?
+                        .map_err(|e| format_db_error("MySQL 读取字段小数位失败", e))?
                         .map(|v| v as i32),
                 })
             })
@@ -179,19 +179,19 @@ impl DbConnection for MySqlConnection {
         .bind(table.table_name.to_lowercase())
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| format!("MySQL 查询索引失败: {}", e))?;
+        .map_err(|e| format_db_error("MySQL 查询索引失败", e))?;
 
         let mut indexes: Vec<IndexInfo> = Vec::new();
         for row in rows {
             let name = row
                 .try_get::<String, _>("index_name")
-                .map_err(|e| format!("MySQL 读取索引名失败: {}", e))?;
+                .map_err(|e| format_db_error("MySQL 读取索引名失败", e))?;
             let non_unique = row
                 .try_get::<i64, _>("NON_UNIQUE")
-                .map_err(|e| format!("MySQL 读取索引唯一性失败: {}", e))?;
+                .map_err(|e| format_db_error("MySQL 读取索引唯一性失败", e))?;
             let column = row
                 .try_get::<String, _>("column_name")
-                .map_err(|e| format!("MySQL 读取索引字段失败: {}", e))?;
+                .map_err(|e| format_db_error("MySQL 读取索引字段失败", e))?;
             if let Some(existing) = indexes.iter_mut().find(|i| i.name == name) {
                 existing.columns.push(column);
             } else {
@@ -210,7 +210,7 @@ impl DbConnection for MySqlConnection {
         let row = sqlx::query("SELECT VERSION() AS ver")
             .fetch_one(&self.pool)
             .await
-            .map_err(|e| format!("获取 MySQL 版本失败: {}", e))?;
+            .map_err(|e| format_db_error("获取 MySQL 版本失败", e))?;
 
         Ok(row.get("ver"))
     }
@@ -219,7 +219,7 @@ impl DbConnection for MySqlConnection {
         sqlx::query(sql)
             .execute(&self.pool)
             .await
-            .map_err(|e| format!("MySQL 执行 SQL 失败: {}", e))?;
+            .map_err(|e| format_db_error("MySQL 执行 SQL 失败", e))?;
         Ok(())
     }
 
@@ -231,7 +231,7 @@ impl DbConnection for MySqlConnection {
         .bind(table.table_name.to_lowercase())
         .fetch_one(&self.pool)
         .await
-        .map_err(|e| format!("MySQL 查询表注释失败: {}", e))?;
+        .map_err(|e| format_db_error("MySQL 查询表注释失败", e))?;
 
         let comment: String = row.get("table_comment");
         if comment.is_empty() {
@@ -252,7 +252,7 @@ impl DbConnection for MySqlConnection {
         .bind(table.table_name.to_lowercase())
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| format!("MySQL 查询字段注释失败: {}", e))?;
+        .map_err(|e| format_db_error("MySQL 查询字段注释失败", e))?;
 
         let mut comments = HashMap::new();
         for row in rows {

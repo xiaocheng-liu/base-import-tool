@@ -1,9 +1,11 @@
-use super::{DbConnection, DbValue};
-use crate::models::{ColumnInfo, ConnectionTestResult, DbConfig, IndexInfo, TableIdentifier};
+use super::{format_db_error, DbConnection, DbValue};
+use crate::models::{ColumnInfo, ConnectionTestResult, DbConfig, IndexInfo, OracleConnectionMode, TableIdentifier};
 use async_trait::async_trait;
 use oracle::{Connection, InitParams};
 use std::env;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
+use tokio::time::timeout;
 
 pub struct OracleConnection {
     conn: Connection,
@@ -14,14 +16,32 @@ impl OracleConnection {
     pub async fn new(config: &DbConfig) -> Result<Self, String> {
         init_oracle_client()?;
 
-        // Oracle 连接字符串格式: //host:port/service_name
-        let connect_string = format!("//{}:{}/{}", config.host, config.port, config.database);
+        // Oracle 连接字符串格式:
+        //   ServiceName: //host:port/service_name
+        //   SID:         //host:port:sid  (注意用冒号分隔)
+        let connect_string = match config.oracle_connection_mode {
+            OracleConnectionMode::SID => {
+                format!("//{}:{}/{}", config.host, config.port, config.database)
+            }
+            OracleConnectionMode::ServiceName => {
+                format!("//{}:{}/{}", config.host, config.port, config.database)
+            }
+        };
 
-        let conn = Connection::connect(
-            config.username.as_str(),
-            config.password.as_str(),
-            connect_string,
-        )
+        let conn = timeout(Duration::from_secs(10), tokio::task::spawn_blocking({
+            let username = config.username.clone();
+            let password = config.password.clone();
+            move || {
+                Connection::connect(
+                    username.as_str(),
+                    password.as_str(),
+                    connect_string,
+                )
+            }
+        }))
+        .await
+        .map_err(|_| "连接 Oracle 超时 (10s)".to_string())?
+        .map_err(|e| format_db_error("Oracle 连接任务失败", e))?
         .map_err(|e| format_oracle_connect_error(&e.to_string()))?;
 
         Ok(OracleConnection {
@@ -51,9 +71,9 @@ fn init_oracle_client() -> Result<(), String> {
     ) {
         InitParams::new()
             .oracle_client_lib_dir(dir)
-            .map_err(|e| format!("设置 Oracle 客户端目录失败: {}", e))?
+            .map_err(|e| format_db_error("设置 Oracle 客户端目录失败", e))?
             .init()
-            .map_err(|e| format!("初始化 Oracle 客户端失败: {}", e))?;
+            .map_err(|e| format_db_error("初始化 Oracle 客户端失败", e))?;
     }
 
     Ok(())
@@ -136,7 +156,7 @@ impl DbConnection for OracleConnection {
                 .conn
                 .statement(&sql)
                 .build()
-                .map_err(|e| format!("准备 Oracle 插入语句失败: {}", e))?;
+                .map_err(|e| format_db_error("准备 Oracle 插入语句失败", e))?;
 
             for (i, val) in row.iter().enumerate() {
                 match val {
@@ -146,10 +166,10 @@ impl DbConnection for OracleConnection {
                     ),
                     DbValue::Text(value) => stmt.bind(i + 1, value as &dyn oracle::sql_type::ToSql),
                 }
-                .map_err(|e| format!("Oracle 绑定参数失败: {}", e))?;
+                .map_err(|e| format_db_error("Oracle 绑定参数失败", e))?;
             }
             stmt.execute(&[])
-                .map_err(|e| format!("Oracle 插入数据失败: {}", e))?;
+                .map_err(|e| format_db_error("Oracle 插入数据失败", e))?;
             inserted += 1;
         }
 
@@ -157,7 +177,7 @@ impl DbConnection for OracleConnection {
         if !self.conn.autocommit() {
             self.conn
                 .commit()
-                .map_err(|e| format!("Oracle 提交失败: {}", e))?;
+                .map_err(|e| format_db_error("Oracle 提交失败", e))?;
         }
 
         Ok(inserted)
@@ -172,7 +192,7 @@ impl DbConnection for OracleConnection {
                 sql,
                 &[&owner.as_str(), &table.table_name.to_uppercase().as_str()],
             )
-            .map_err(|e| format!("Oracle 查询表存在性失败: {}", e))?;
+            .map_err(|e| format_db_error("Oracle 查询表存在性失败", e))?;
 
         // ResultSet 实现了 Iterator
         if let Some(Ok(count)) = result_set.next() {
@@ -191,11 +211,11 @@ impl DbConnection for OracleConnection {
                 sql,
                 &[&owner.as_str(), &table.table_name.to_uppercase().as_str()],
             )
-            .map_err(|e| format!("Oracle 查询字段失败: {}", e))?;
+            .map_err(|e| format_db_error("Oracle 查询字段失败", e))?;
 
         rows.map(|row| {
             let (name, data_type, data_length, data_precision, data_scale) =
-                row.map_err(|e| format!("Oracle 读取字段失败: {}", e))?;
+                row.map_err(|e| format_db_error("Oracle 读取字段失败", e))?;
             Ok(ColumnInfo {
                 name,
                 data_type,
@@ -216,12 +236,12 @@ impl DbConnection for OracleConnection {
                 sql,
                 &[&owner.as_str(), &table.table_name.to_uppercase().as_str()],
             )
-            .map_err(|e| format!("Oracle 查询索引失败: {}", e))?;
+            .map_err(|e| format_db_error("Oracle 查询索引失败", e))?;
 
         let mut indexes: Vec<IndexInfo> = Vec::new();
         for row in rows {
             let (name, uniqueness, column) =
-                row.map_err(|e| format!("Oracle 读取索引失败: {}", e))?;
+                row.map_err(|e| format_db_error("Oracle 读取索引失败", e))?;
             if let Some(existing) = indexes.iter_mut().find(|i| i.name == name) {
                 existing.columns.push(column);
             } else {
@@ -239,7 +259,7 @@ impl DbConnection for OracleConnection {
         let mut result_set = self
             .conn
             .query_as::<String>("SELECT BANNER FROM V$VERSION WHERE ROWNUM = 1", &[])
-            .map_err(|e| format!("获取 Oracle 版本失败: {}", e))?;
+            .map_err(|e| format_db_error("获取 Oracle 版本失败", e))?;
 
         Ok(result_set
             .next()
@@ -250,7 +270,7 @@ impl DbConnection for OracleConnection {
     async fn execute_raw_sql(&self, sql: &str) -> Result<(), String> {
         self.conn
             .execute(sql, &[])
-            .map_err(|e| format!("Oracle 执行 SQL 失败: {}", e))?;
+            .map_err(|e| format_db_error("Oracle 执行 SQL 失败", e))?;
         Ok(())
     }
 }

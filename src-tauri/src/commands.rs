@@ -7,7 +7,7 @@ use csv::ReaderBuilder;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use tauri::{Emitter, State};
+use tauri::State;
 use uuid::Uuid;
 
 /// 全局状态：存储数据库配置
@@ -21,17 +21,6 @@ pub struct AppState {
 #[tauri::command]
 pub fn scan_csv_files(folder_path: String) -> Result<Vec<CsvFileInfo>, String> {
     csv_parser::scan_folder(&folder_path)
-}
-
-/// 获取表字段和注释信息（从 DDL 文件解析）
-#[tauri::command]
-pub fn get_table_schema(
-    schema_dir: String,
-    target_db: String,
-    table_name: String,
-) -> Result<TableSchemaInfo, String> {
-    let converter = DdlConverter::new(PathBuf::from(schema_dir));
-    converter.get_table_schema(&target_db, &table_name)
 }
 
 /// 获取所有数据库配置
@@ -82,11 +71,9 @@ pub async fn test_connection(config: DbConfig) -> Result<ConnectionTestResult, S
 /// 开始导入任务
 #[tauri::command]
 pub async fn start_import(
-    app_handle: tauri::AppHandle,
     state: State<'_, AppState>,
     csv_files: Vec<CsvFileInfo>,
     db_config_id: String,
-    truncate_first: bool,
 ) -> Result<Vec<ImportTask>, String> {
     let db_config = {
         let configs = state.db_configs.lock().map_err(|e| e.to_string())?;
@@ -100,46 +87,6 @@ pub async fn start_import(
 
     let db_type = db_config.db_type.clone();
     let conn = db::create_connection(&db_config).await?;
-    let _ = app_handle.emit("import-log", format!("▶ 连接数据库成功 ({})", db_config.db_type));
-
-    // 先清空所有目标表
-    if truncate_first {
-        let _ = app_handle.emit("import-log", "▶ 开始清空目标表...");
-        for csv_file in &csv_files {
-            let target_table = import_target_table(csv_file);
-            let table_label = format!("{}.{}", target_table.schema, target_table.table_name);
-            match conn.schema_table_exists(&target_table).await {
-                Ok(true) => {
-                    // 优先尝试 TRUNCATE（快），失败则降级为 DELETE（兼容外键约束）
-                    let truncate_sql = match &db_config.db_type {
-                        DbType::MySQL => format!("TRUNCATE TABLE `{}`.`{}`", target_table.schema.to_lowercase(), target_table.table_name.to_lowercase()),
-                        DbType::PostgreSQL => format!("TRUNCATE TABLE \"{}\".\"{}\"", target_table.schema.to_lowercase(), target_table.table_name.to_lowercase()),
-                        _ => format!("TRUNCATE TABLE \"{}\".\"{}\"", target_table.schema.to_uppercase(), target_table.table_name.to_uppercase()),
-                    };
-                    let _ = app_handle.emit("import-log", format!("  SQL: {}", truncate_sql));
-                    match conn.execute_raw_sql(&truncate_sql).await {
-                        Ok(_) => {
-                            let _ = app_handle.emit("import-log", format!("  ✓ 清空表 {}", table_label));
-                        }
-                        Err(truncate_err) => {
-                            let _ = app_handle.emit("import-log", format!("  ⚠ TRUNCATE 失败: {}，尝试 DELETE...", truncate_err));
-                            let delete_sql = match &db_config.db_type {
-                                DbType::MySQL => format!("DELETE FROM `{}`.`{}`", target_table.schema.to_lowercase(), target_table.table_name.to_lowercase()),
-                                DbType::PostgreSQL => format!("DELETE FROM \"{}\".\"{}\"", target_table.schema.to_lowercase(), target_table.table_name.to_lowercase()),
-                                _ => format!("DELETE FROM \"{}\".\"{}\"", target_table.schema.to_uppercase(), target_table.table_name.to_uppercase()),
-                            };
-                            let _ = app_handle.emit("import-log", format!("  SQL: {}", delete_sql));
-                            conn.execute_raw_sql(&delete_sql).await
-                                .map_err(|e| format!("清空表 {} 失败: {}", table_label, e))?;
-                            let _ = app_handle.emit("import-log", format!("  ✓ 清空表 {}", table_label));
-                        }
-                    }
-                }
-                Ok(false) => {}
-                Err(e) => return Err(format!("检查表 {} 是否存在失败: {}", table_label, e)),
-            }
-        }
-    }
 
     let mut tasks = Vec::new();
 
@@ -170,6 +117,7 @@ pub async fn start_import(
                     total_rows,
                     imported_rows: 0,
                     error_message: None,
+                    errors: vec![],
                 },
             );
         }
@@ -177,58 +125,14 @@ pub async fn start_import(
         tasks.push(task);
     }
 
-    // 异步并发执行导入：每个表独立连接、独立 tokio 任务
+    // 异步执行导入，conn 必须 move 进去避免 use-after-free
     let progress_map = Arc::clone(&state.import_progress);
-    let db_config_for_spawn = db_config.clone();
-    let total_tasks = tasks.len();
     let tasks_for_spawn = tasks.clone();
     tokio::spawn(async move {
-        // 限制最大并发数，避免过多连接压垮数据库
-        let max_concurrent = 5usize;
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent));
-        let mut join_set = tokio::task::JoinSet::new();
-
         for task in &tasks_for_spawn {
-            let permit = Arc::clone(&semaphore);
-            let task = task.clone();
-            let progress_map = Arc::clone(&progress_map);
-            let db_config = db_config_for_spawn.clone();
-            let db_type = db_type.clone();
-            let app_handle = app_handle.clone();
-
-            join_set.spawn(async move {
-                let _permit = permit.acquire().await;
-                let _ = app_handle.emit(
-                    "import-log",
-                    format!("▶ 开始导入 [{}.{}]", task.csv_file.target_db, task.csv_file.table_name),
-                );
-                match db::create_connection(&db_config).await {
-                    Ok(conn) => {
-                        execute_import(&conn, &task, &progress_map, &db_type, truncate_first, &app_handle).await;
-                        // conn 在离开作用域时自动释放
-                    }
-                    Err(e) => {
-                        update_progress(
-                            &progress_map,
-                            &task.id,
-                            ImportStatus::Failed,
-                            0.0,
-                            0,
-                            0,
-                            Some(format!("创建数据库连接失败: {}", e)),
-                        );
-                    }
-                }
-            });
+            execute_import(&conn, task, &progress_map, &db_type).await;
         }
-
-        // 等待所有导入任务完成
-        while join_set.join_next().await.is_some() {}
-
-        let _ = app_handle.emit(
-            "import-log",
-            format!("══════ 导入完成 ({} 个表) ══════", total_tasks),
-        );
+        // conn 在这里 drop，确保所有任务完成后才释放连接
     });
 
     Ok(tasks)
@@ -240,8 +144,6 @@ async fn execute_import(
     task: &ImportTask,
     progress_map: &Arc<Mutex<HashMap<String, ImportProgress>>>,
     db_type: &DbType,
-    truncate_first: bool,
-    app_handle: &tauri::AppHandle,
 ) {
     // 更新状态为运行中
     update_progress(
@@ -255,8 +157,8 @@ async fn execute_import(
     );
 
     match task.csv_file.file_type {
-        ImportFileType::Csv => execute_csv_import(conn, task, progress_map, app_handle).await,
-        ImportFileType::Sql => execute_sql_import(conn, task, progress_map, db_type, truncate_first, app_handle).await,
+        ImportFileType::Csv => execute_csv_import(conn, task, progress_map).await,
+        ImportFileType::Sql => execute_sql_import(conn, task, progress_map, db_type).await,
     }
 }
 
@@ -297,7 +199,6 @@ async fn execute_csv_import(
     conn: &Box<dyn DbConnection>,
     task: &ImportTask,
     progress_map: &Arc<Mutex<HashMap<String, ImportProgress>>>,
-    app_handle: &tauri::AppHandle,
 ) {
     let csv_data = match read_csv_data(&task.csv_file.file_path) {
         Ok(data) => data,
@@ -318,17 +219,6 @@ async fn execute_csv_import(
     let columns = &csv_data.columns;
     let rows = &csv_data.rows;
     let total_rows = rows.len();
-    let _ = app_handle.emit("import-log", format!("  CSV 导入: {} 行", total_rows));
-
-    // 更新 total_rows 为实际读取的行数
-    {
-        if let Ok(mut map) = progress_map.lock() {
-            if let Some(p) = map.get_mut(&task.id) {
-                p.total_rows = total_rows;
-            }
-        }
-    }
-
     let target_table = import_target_table(&task.csv_file);
     let target_table_label = format!("{}.{}", target_table.schema, target_table.table_name);
 
@@ -419,8 +309,6 @@ async fn execute_sql_import(
     task: &ImportTask,
     progress_map: &Arc<Mutex<HashMap<String, ImportProgress>>>,
     db_type: &DbType,
-    truncate_first: bool,
-    app_handle: &tauri::AppHandle,
 ) {
     let sql = match read_sql_data(&task.csv_file.file_path) {
         Ok(sql) => sql,
@@ -438,7 +326,7 @@ async fn execute_sql_import(
         }
     };
 
-    let statements = prepare_sql_statements(&sql, db_type, &task.csv_file.target_db, truncate_first);
+    let statements = prepare_sql_statements(&sql, db_type, &task.csv_file.target_db);
     if statements.is_empty() {
         update_progress(
             progress_map,
@@ -453,11 +341,8 @@ async fn execute_sql_import(
     }
 
     let total = statements.len();
-    let _ = app_handle.emit("import-log", format!("  ▶ 共 {} 条 SQL 语句", total));
     for (index, statement) in statements.iter().enumerate() {
-        let _ = app_handle.emit("import-log", format!("  SQL ({}/{}): {}", index + 1, total, statement));
         if let Err(e) = conn.execute_raw_sql(statement).await {
-            let error_msg = format_error_message(&e, statement);
             update_progress(
                 progress_map,
                 &task.id,
@@ -465,7 +350,7 @@ async fn execute_sql_import(
                 0.0,
                 total,
                 index,
-                Some(error_msg),
+                Some(format!("执行 SQL 文件失败: {}", e)),
             );
             return;
         }
@@ -489,191 +374,36 @@ async fn execute_sql_import(
     }
 }
 
-/// 格式化错误信息，提供更友好的错误提示和解决建议。
-fn format_error_message(e: &str, statement: &str) -> String {
-    let mut msg = format!("执行 SQL 文件失败: {}", e);
-    
-    // 打印完整的 SQL 语句（不截断）
-    msg.push_str(&format!("\n\n出错 SQL (完整):\n{}", statement));
-    
-    // 根据错误类型提供解决建议
-    if e.contains("1264") || e.contains("Out of range") {
-        msg.push_str("\n\n解决建议：");
-        msg.push_str("\n1. 检查 SQL 文件中对应列的值是否超出目标表列的范围");
-        msg.push_str("\n2. 检查目标表列的类型是否为 TINYINT（范围 -128~127 或 0~255）");
-        msg.push_str("\n3. 如果是，请将目标表列类型改为 INT 或 BIGINT");
-        msg.push_str("\n4. 或者修改 SQL 文件，将超出范围的值改为在范围内的");
-    } else if e.contains("1411") || e.contains("Incorrect datetime value") {
-        msg.push_str("\n\n解决建议：");
-        msg.push_str("\n1. 检查 SQL 文件中日期值的格式是否与 TO_DATE 的格式字符串匹配");
-        msg.push_str("\n2. 如果日期值是标准格式（YYYY-MM-DD HH:MM:SS），可以尝试去掉 TO_DATE 函数");
-        msg.push_str("\n3. 或者修改 TO_DATE 的格式字符串，使其与日期值匹配");
-    } else if e.contains("1062") || e.contains("Duplicate entry") {
-        msg.push_str("\n\n解决建议：");
-        msg.push_str("\n1. 检查是否有重复的数据");
-        msg.push_str("\n2. 如果勾选了'清空表'，请确保清空操作成功执行");
-        msg.push_str("\n3. 或者手动删除目标表中的数据后再导入");
-    }
-    
-    msg
-}
-
-pub fn prepare_sql_statements(sql: &str, db_type: &DbType, target_db: &str, truncate_first: bool) -> Vec<String> {
+pub fn prepare_sql_statements(sql: &str, db_type: &DbType, target_db: &str) -> Vec<String> {
     split_sql_statements(sql)
         .into_iter()
-        .map(|stmt| adapt_sql_statement(&stmt, db_type, target_db, truncate_first))
-        .map(|stmt| {
-            // 去除每个语句末尾的注释行
-            let cleaned = strip_trailing_line_comments(&stmt);
-            if cleaned.trim().is_empty() {
-                String::new()
-            } else {
-                cleaned
-            }
-        })
-        .filter(|stmt| {
-            let trimmed = stmt.trim();
-            if trimmed.is_empty() {
-                return false;
-            }
-            // 过滤掉 COMMIT / ROLLBACK 等事务控制语句
-            let upper = trimmed.to_uppercase();
-            if upper == "COMMIT" || upper == "ROLLBACK" || upper.starts_with("COMMIT;") || upper.starts_with("ROLLBACK;") {
-                return false;
-            }
-            // 过滤掉纯注释或仅含注释+空白的分号块
-            !is_comment_only(trimmed)
-        })
+        .map(|stmt| adapt_sql_statement(&stmt, db_type, target_db))
+        .filter(|stmt| !stmt.trim().is_empty())
         .collect()
 }
 
-/// 去除 SQL 语句末尾的注释行（-- 开头的行注释），返回去除注释后的 SQL。
-fn strip_trailing_line_comments(s: &str) -> String {
-    let lines: Vec<&str> = s.lines().collect();
-    let mut end = lines.len();
-    
-    // 从末尾向前找，找到第一个非注释非空行
-    for (i, line) in lines.iter().enumerate().rev() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with("--") {
-            end = i;
-        } else {
-            break;
-        }
-    }
-    
-    if end == 0 {
-        return String::new();
-    }
-    
-    lines[..end].join("\n")
-}
-
-/// 判断字符串是否仅由 SQL 注释和空白组成（无实际 SQL 语句）。
-fn is_comment_only(s: &str) -> bool {
-    // 先去掉末尾的注释行
-    let cleaned = strip_trailing_line_comments(s);
-    if cleaned.is_empty() {
-        return true;
-    }
-    
-    let mut in_block_comment = false;
-    for line in cleaned.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        
-        // 处理块注释跨行的情况
-        if in_block_comment {
-            if trimmed.contains("*/") {
-                in_block_comment = false;
-            }
-            continue;
-        }
-        
-        // 检查是否有 /* 开头的块注释
-        if trimmed.starts_with("/*") {
-            if !trimmed.ends_with("*/") {
-                in_block_comment = true;
-            }
-            continue;
-        }
-        
-        if trimmed.starts_with("--") {
-            continue;
-        }
-        
-        // 检查是否是 SET 语句（如 SET DEFINE OFF）——这些也应该被过滤
-        let upper = trimmed.to_uppercase();
-        if upper.starts_with("SET ") || upper.starts_with("PROMPT ") {
-            continue;
-        }
-        
-        // 有非注释内容
-        return false;
-    }
-    // 如果还在块注释中，也算注释
-    true
-}
-
-/// 去除 SQL 开头的注释行（-- 和 /* */ 块注释），返回去除注释后的 SQL。
-fn strip_leading_comments(sql: &str) -> &str {
-    let bytes = sql.as_bytes();
-    let mut pos = 0;
-    let len = bytes.len();
-    
-    while pos < len {
-        // 跳过空白
-        while pos < len && bytes[pos].is_ascii_whitespace() {
-            pos += 1;
-        }
-        
-        if pos >= len {
-            break;
-        }
-        
-        // 检查 -- 行注释
-        if pos + 1 < len && bytes[pos] == b'-' && bytes[pos + 1] == b'-' {
-            // 跳到行尾
-            while pos < len && bytes[pos] != b'\n' && bytes[pos] != b'\r' {
-                pos += 1;
-            }
-            continue;
-        }
-        
-        // 检查 /* 块注释
-        if pos + 1 < len && bytes[pos] == b'/' && bytes[pos + 1] == b'*' {
-            // 找到 */
-            pos += 2;
-            while pos + 1 < len {
-                if bytes[pos] == b'*' && bytes[pos + 1] == b'/' {
-                    pos += 2;
-                    break;
-                }
-                pos += 1;
-            }
-            continue;
-        }
-        
-        // 不是注释，停止
-        break;
-    }
-    
-    &sql[pos..]
-}
-
 fn split_sql_statements(sql: &str) -> Vec<String> {
-    // 先去除开头的注释
-    let sql = strip_leading_comments(sql);
-    
     let mut result = Vec::new();
     let mut current = String::new();
     let mut in_single_quote = false;
     let mut in_double_quote = false;
     let mut previous = '\0';
+    let mut in_line_comment = false;
 
     for ch in sql.chars() {
+        if in_line_comment {
+            if ch == '\n' {
+                in_line_comment = false;
+                current.clear();
+            }
+            continue;
+        }
+        if ch == '-' && previous == '-' && !in_single_quote && !in_double_quote {
+            // 进入行注释，回退已添加的 '-' 并清空当前行
+            current.pop();
+            in_line_comment = true;
+            continue;
+        }
         match ch {
             '\'' if previous != '\\' && !in_double_quote => {
                 in_single_quote = !in_single_quote;
@@ -703,393 +433,147 @@ fn split_sql_statements(sql: &str) -> Vec<String> {
     result
 }
 
-fn adapt_sql_statement(sql: &str, db_type: &DbType, target_db: &str, truncate_first: bool) -> String {
-    let sql = convert_oracle_functions(sql, db_type);
+/// 将 Oracle 的 TO_DATE 函数转换为目标数据库的对应函数。
+/// MySQL: `TO_DATE('2025-01-01', 'YYYY-MM-DD')` → `STR_TO_DATE('2025-01-01', '%Y-%m-%d')`
+/// PostgreSQL: `TO_DATE(...)` → `TO_TIMESTAMP(...)`
+fn convert_oracle_to_date(sql: &str, db_type: &DbType) -> String {
     match db_type {
-        DbType::MySQL => {
-            let sql = ensure_mysql_target_db(
-                &replace_quoted_identifiers(&sql, '`', true),
-                target_db,
-            );
-            if truncate_first {
-                sql
-            } else {
-                with_mysql_duplicate_key_update(&sql)
-            }
-        },
-        DbType::PostgreSQL => replace_quoted_identifiers(&sql, '"', true),
-        _ => sql.trim().to_string(),
-    }
-}
-
-/// 将 Oracle 特有函数转换为目标数据库的等价函数。
-fn convert_oracle_functions(sql: &str, db_type: &DbType) -> String {
-    match db_type {
-        DbType::MySQL => convert_to_date_for_mysql(sql),
-        DbType::PostgreSQL => convert_to_date_for_postgres(sql),
+        DbType::MySQL => convert_to_date_inner(sql, "STR_TO_DATE", true),
+        DbType::PostgreSQL => convert_to_date_inner(sql, "TO_TIMESTAMP", false),
         _ => sql.to_string(),
     }
 }
 
-/// 将 Oracle TO_DATE(d, fmt) 转换为 MySQL STR_TO_DATE(d, fmt)。
-fn convert_to_date_for_mysql(sql: &str) -> String {
-    // 打印转换前的 SQL（用于调试）
-    // println!("Before conversion: {}", sql);
-    let result = replace_oracle_function(sql, "TO_DATE", "STR_TO_DATE", |fmt| {
-        let converted = oracle_date_fmt_to_mysql(fmt);
-        // println!("Format conversion: {} -> {}", fmt, converted);
-        clean_mysql_date_fmt(&converted)
-    });
-    // println!("After conversion: {}", result);
-    result
-}
-
-/// 将 Oracle TO_DATE(d, fmt) 转换为 PostgreSQL TO_TIMESTAMP(d, fmt)。
-fn convert_to_date_for_postgres(sql: &str) -> String {
-    replace_oracle_function(sql, "TO_DATE", "TO_TIMESTAMP", |fmt| {
-        oracle_date_fmt_to_postgres(fmt)
-    })
-}
-
-/// 通用 Oracle 函数替换：将 func_name(args) 替换为 target_func(transformed_args)。
-/// transform_fn 对第一个参数后的格式字符串进行转换。
-fn replace_oracle_function<F>(sql: &str, func_name: &str, target_func: &str, transform_fn: F) -> String
-where
-    F: Fn(&str) -> String,
-{
-    let upper_sql = sql.to_uppercase();
-    let upper_func = func_name.to_uppercase();
+/// 核心替换逻辑：找到所有 TO_DATE(...) 调用并替换为目标函数。
+/// 注意排除已转换的 STR_TO_DATE 中包含的 TO_ 前缀。
+fn convert_to_date_inner(sql: &str, target_func: &str, convert_format: bool) -> String {
+    let upper = sql.to_uppercase();
     let mut result = String::with_capacity(sql.len());
-    let mut search_start = 0usize;
+    let mut pos = 0;
 
-    while let Some(pos) = upper_sql[search_start..].find(&upper_func) {
-        let abs_pos = search_start + pos;
-
-        // 检查前面是否是合法边界（空白、逗号、(、行首）
-        let before_ok = abs_pos == 0 || {
-            let c = sql.as_bytes()[abs_pos - 1];
-            c.is_ascii_whitespace() || c == b',' || c == b'(' || c == b'=' || c == b'>' || c == b'<'
-        };
-
-        // 检查后面是否是 (
-        let after_func = abs_pos + upper_func.len();
-        let after_ok = after_func < sql.len() && sql.as_bytes()[after_func] == b'(';
-
-        if !before_ok || !after_ok {
-            // 不是函数调用，继续搜索
-            result.push_str(&sql[search_start..after_func]);
-            search_start = after_func;
-            continue;
-        }
-
-        // 找到函数调用，提取参数
-        result.push_str(&sql[search_start..abs_pos]);
-        result.push_str(target_func);
-
-        // 解析括号内的参数
-        let (args_str, paren_end) = extract_parenthesized_args(&sql, after_func);
-
-        // 转换参数：只转换第二个参数（格式字符串）
-        let converted_args = transform_oracle_func_args(&args_str, &transform_fn);
-        result.push('(');
-        result.push_str(&converted_args);
-        result.push(')');
-
-        search_start = paren_end + 1;
-    }
-
-    result.push_str(&sql[search_start..]);
-    result
-}
-
-/// 提取括号内的参数内容，返回 (参数内容, 右括号位置)。
-fn extract_parenthesized_args(sql: &str, open_paren_pos: usize) -> (String, usize) {
-    let bytes = sql.as_bytes();
-    let mut depth = 0u32;
-    let mut in_single_quote = false;
-    let start = open_paren_pos + 1; // 跳过 (
-
-    for (i, &ch) in bytes.iter().enumerate().skip(start) {
-        if ch == b'\'' {
-            in_single_quote = !in_single_quote;
-            continue;
-        }
-        if in_single_quote {
-            continue;
-        }
-        if ch == b'(' {
-            depth += 1;
-        } else if ch == b')' {
-            if depth == 0 {
-                return (sql[start..i].to_string(), i);
+    loop {
+        match find_sql_keyword(&upper[pos..], "TO_DATE") {
+            Some(rel_pos) => {
+                let abs_pos = pos + rel_pos;
+                // 推入前面的内容
+                result.push_str(&sql[pos..abs_pos]);
+                // 找到 TO_DATE( 的括号范围
+                let open = abs_pos + "TO_DATE".len();
+                // 跳过 (
+                let paren_start = open;
+                if paren_start >= sql.len() || sql.as_bytes()[paren_start] != b'(' {
+                    // 不应该走到这里，容错
+                    result.push_str("TO_DATE");
+                    pos = open;
+                    continue;
+                }
+                // 找到匹配的 )
+                let close = find_matching_paren(sql, paren_start);
+                // 提取 TO_DATE 括号内的内容
+                let inner = &sql[paren_start + 1..close];
+                if convert_format {
+                    let converted = convert_oracle_date_format(inner);
+                    result.push_str(target_func);
+                    result.push('(');
+                    result.push_str(&converted);
+                    result.push(')');
+                } else {
+                    result.push_str(target_func);
+                    result.push('(');
+                    result.push_str(inner);
+                    result.push(')');
+                }
+                pos = close + 1;
             }
-            depth -= 1;
-        }
-    }
-
-    // 未找到匹配的右括号，返回从 ( 到末尾的内容
-    (sql[start..].to_string(), sql.len() - 1)
-}
-
-/// 转换 Oracle 函数参数列表：第二个参数（格式字符串）应用 transform_fn。
-fn transform_oracle_func_args<F>(args: &str, transform_fn: &F) -> String
-where
-    F: Fn(&str) -> String,
-{
-    let parts = split_args_preserving_quotes(args);
-    if parts.len() < 2 {
-        return args.to_string();
-    }
-
-    let mut result = parts[0].clone();
-    for (i, part) in parts.iter().enumerate().skip(1) {
-        result.push(',');
-        if i == 1 {
-            // 第二个参数是格式字符串，去掉外层引号后转换，再包裹回去
-            let trimmed = part.trim();
-            let inner = trim_outer_quotes(trimmed);
-            let transformed = transform_fn(&inner);
-            let leading_spaces: String = part.chars().take_while(|c| c.is_whitespace()).collect();
-            result.push_str(&leading_spaces);
-            result.push('\'');
-            result.push_str(&transformed);
-            result.push('\'');
-        } else {
-            result.push_str(part);
+            None => {
+                result.push_str(&sql[pos..]);
+                break;
+            }
         }
     }
     result
 }
 
-/// 去掉字符串外层匹配的单引号或双引号。
-fn trim_outer_quotes(s: &str) -> String {
-    let s = s.trim();
-    if s.len() >= 2 {
-        let bytes = s.as_bytes();
-        let first = bytes[0];
-        let last = bytes[bytes.len() - 1];
-        if (first == b'\'' && last == b'\'') || (first == b'"' && last == b'"') {
-            return s[1..s.len() - 1].to_string();
-        }
-    }
-    s.to_string()
-}
-
-/// 按逗号分割参数，保留引号内逗号。
-fn split_args_preserving_quotes(s: &str) -> Vec<String> {
-    let mut parts = Vec::new();
-    let mut current = String::new();
-    let mut in_single_quote = false;
+/// 找到与 pos 处 ( 匹配的 ) 位置。
+fn find_matching_paren(s: &str, open_pos: usize) -> usize {
     let bytes = s.as_bytes();
+    let mut depth = 0;
+    let mut in_single_quote = false;
+    let mut prev = 0u8;
 
-    for &ch in bytes {
-        if ch == b'\'' {
+    for (i, &ch) in bytes[open_pos..].iter().enumerate() {
+        if ch == b'\'' && prev != b'\\' {
             in_single_quote = !in_single_quote;
-            current.push(ch as char);
-        } else if ch == b',' && !in_single_quote {
-            parts.push(current.clone());
-            current.clear();
-        } else {
-            current.push(ch as char);
-        }
-    }
-    if !current.is_empty() {
-        parts.push(current);
-    }
-    parts
-}
-
-/// Oracle 日期格式模型 → MySQL STR_TO_DATE 格式模型。
-fn oracle_date_fmt_to_mysql(fmt: &str) -> String {
-    let mut result = String::with_capacity(fmt.len());
-    let chars: Vec<char> = fmt.chars().collect();
-    let mut i = 0;
-    while i < chars.len() {
-        if chars[i] == '\'' {
-            // 字面量文本，原样保留
-            result.push('\'');
-            i += 1;
-            while i < chars.len() && chars[i] != '\'' {
-                result.push(chars[i]);
-                i += 1;
-            }
-            if i < chars.len() {
-                result.push('\'');
-                i += 1;
-            }
-        } else if i + 1 < chars.len() && chars[i] == 'M' && chars[i + 1] == 'I' {
-            // MI → %i (minutes)
-            result.push_str("%i");
-            i += 2;
-        } else if i + 1 < chars.len() && chars[i] == 'S' && chars[i + 1] == 'S' {
-            // SS → %s (seconds)
-            result.push_str("%s");
-            i += 2;
-        } else if i + 1 < chars.len() && (chars[i] == 'A' || chars[i] == 'P') && chars[i + 1] == 'M' {
-            // AM/PM → %p
-            result.push_str("%p");
-            i += 2;
-        } else if chars[i] == 'Y' || chars[i] == 'y' {
-            let start = i;
-            while i < chars.len() && (chars[i] == 'Y' || chars[i] == 'y') {
-                i += 1;
-            }
-            let count = i - start;
-            match count {
-                4 => result.push_str("%Y"),
-                2 => result.push_str("%y"),
-                _ => result.push_str(&fmt[start..i]),
-            }
-        } else if chars[i] == 'M' {
-            let start = i;
-            while i < chars.len() && chars[i] == 'M' {
-                i += 1;
-            }
-            let count = i - start;
-            match count {
-                1 => result.push_str("%c"),
-                2 => result.push_str("%m"),
-                3 | 4 => result.push_str("%M"),
-                _ => result.push_str(&fmt[start..i]),
-            }
-        } else if chars[i] == 'D' {
-            let start = i;
-            while i < chars.len() && chars[i] == 'D' {
-                i += 1;
-            }
-            let count = i - start;
-            match count {
-                1 => result.push_str("%e"),
-                2 => result.push_str("%d"),
-                3 | 4 => result.push_str("%W"),
-                _ => result.push_str(&fmt[start..i]),
-            }
-        } else if chars[i] == 'H' {
-            let start = i;
-            while i < chars.len() && chars[i] == 'H' {
-                i += 1;
-            }
-            let count = i - start;
-            match count {
-                2 if start + 2 < chars.len() && chars[start + 2] == '2' && chars[start + 3] == '4' => {
-                    // HH24 → %H
-                    result.push_str("%H");
-                    i += 2;
-                }
-                2 => result.push_str("%H"),
-                _ => result.push_str(&fmt[start..i]),
-            }
-        } else {
-            // 分隔符等，原样保留
-            result.push(chars[i]);
-            i += 1;
-        }
-    }
-    result
-}
-
-/// 清理转换后的 MySQL 日期格式字符串，去除可能的多余字符。
-/// 例如，如果格式字符串以非 % 开头的字母开头，可能是转换残留，需要清理。
-fn clean_mysql_date_fmt(fmt: &str) -> String {
-    // 如果格式字符串以字母开头且不是 %，则去掉开头的字母
-    let mut chars = fmt.chars();
-    if let Some(first) = chars.next() {
-        if first.is_alphabetic() && first != '%' {
-            // 去掉开头的所有字母，直到遇到 % 或非字母
-            let mut result = String::new();
-            let mut found_percent = false;
-            for c in fmt.chars() {
-                if c == '%' {
-                    found_percent = true;
-                }
-                if found_percent {
-                    result.push(c);
+        } else if !in_single_quote {
+            if ch == b'(' {
+                depth += 1;
+            } else if ch == b')' {
+                depth -= 1;
+                if depth == 0 {
+                    return open_pos + i;
                 }
             }
-            return result;
         }
+        prev = ch;
     }
-    fmt.to_string()
+    s.len() - 1
 }
 
-/// Oracle 日期格式模型 → PostgreSQL TO_TIMESTAMP 格式模型。
-fn oracle_date_fmt_to_postgres(fmt: &str) -> String {
-    let mut result = String::with_capacity(fmt.len());
-    let chars: Vec<char> = fmt.chars().collect();
-    let mut i = 0;
-    while i < chars.len() {
-        if chars[i] == '\'' {
-            result.push('"');
-            i += 1;
-            while i < chars.len() && chars[i] != '\'' {
-                result.push(chars[i]);
-                i += 1;
+/// 将 Oracle 日期格式字符串转换为 MySQL STR_TO_DATE 格式。
+/// YYYY→%Y, MM→%m, DD→%d, HH24→%H, MI→%i, SS→%s
+fn convert_oracle_date_format(inner: &str) -> String {
+    // inner 格式: 'date_value', 'Oracle_format_string'
+    // 找到第二个单引号字符串的位置，对其中的格式标识符做替换
+    let bytes = inner.as_bytes();
+    let mut in_quote = false;
+    let mut escaped = false;
+    let mut quote_count = 0;
+    let mut format_start = 0;
+
+    for (i, &ch) in bytes.iter().enumerate() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == b'\\' {
+            escaped = true;
+            continue;
+        }
+        if ch == b'\'' {
+            in_quote = !in_quote;
+            if !in_quote {
+                quote_count += 1;
+            } else if quote_count == 1 {
+                // 进入第二个引号字符串（格式字符串）
+                format_start = i + 1;
             }
-            if i < chars.len() {
-                result.push('"');
-                i += 1;
-            }
-        } else if i + 1 < chars.len() && chars[i] == 'M' && chars[i + 1] == 'I' {
-            // MI → MI (PostgreSQL keeps same)
-            result.push_str("MI");
-            i += 2;
-        } else if i + 1 < chars.len() && chars[i] == 'S' && chars[i + 1] == 'S' {
-            // SS → SS
-            result.push_str("SS");
-            i += 2;
-        } else if i + 1 < chars.len() && (chars[i] == 'A' || chars[i] == 'P') && chars[i + 1] == 'M' {
-            result.push_str(&fmt[i..i + 2]);
-            i += 2;
-        } else if chars[i] == 'Y' || chars[i] == 'y' {
-            let start = i;
-            while i < chars.len() && (chars[i] == 'Y' || chars[i] == 'y') {
-                i += 1;
-            }
-            let count = i - start;
-            match count {
-                4 => result.push_str("YYYY"),
-                2 => result.push_str("YY"),
-                _ => result.push_str(&fmt[start..i]),
-            }
-        } else if chars[i] == 'M' {
-            let start = i;
-            while i < chars.len() && chars[i] == 'M' {
-                i += 1;
-            }
-            let count = i - start;
-            match count {
-                2 => result.push_str("MM"),
-                3 | 4 => result.push_str("Month"),
-                _ => result.push_str(&fmt[start..i]),
-            }
-        } else if chars[i] == 'D' {
-            let start = i;
-            while i < chars.len() && chars[i] == 'D' {
-                i += 1;
-            }
-            let count = i - start;
-            match count {
-                2 => result.push_str("DD"),
-                3 | 4 => result.push_str("Day"),
-                _ => result.push_str(&fmt[start..i]),
-            }
-        } else if chars[i] == 'H' {
-            let start = i;
-            while i < chars.len() && chars[i] == 'H' {
-                i += 1;
-            }
-            if start + 2 < chars.len() && chars.get(start + 2) == Some(&'2') && chars.get(start + 3) == Some(&'4') {
-                result.push_str("HH24");
-                i = start + 4;
-            } else {
-                result.push_str(&fmt[start..i]);
-            }
-        } else {
-            result.push(chars[i]);
-            i += 1;
         }
     }
-    result
+
+    let format_str = &inner[format_start..];
+    // 提取引号内的格式字符串并做替换
+    let format_inner = format_str.trim_end_matches('\'');
+    let converted_format = format_inner
+        .replace("HH24", "%H")
+        .replace("YYYY", "%Y")
+        .replace("MM", "%m")
+        .replace("DD", "%d")
+        .replace("MI", "%i")
+        .replace("SS", "%s");
+
+    format!("{}'{}'", &inner[..format_start], converted_format)
+}
+
+fn adapt_sql_statement(sql: &str, db_type: &DbType, target_db: &str) -> String {
+    let with_date_conv = convert_oracle_to_date(sql, db_type);
+    match db_type {
+        DbType::MySQL => with_mysql_duplicate_key_update(&ensure_mysql_target_db(
+            &replace_quoted_identifiers(&with_date_conv, '`', true),
+            target_db,
+        )),
+        DbType::PostgreSQL => replace_quoted_identifiers(&with_date_conv, '"', true),
+        _ => with_date_conv.trim().to_string(),
+    }
 }
 
 fn replace_quoted_identifiers(sql: &str, quote_char: char, lowercase: bool) -> String {
@@ -1146,16 +630,15 @@ fn with_mysql_duplicate_key_update(sql: &str) -> String {
         pos
     } else if let Some(pos) = find_sql_keyword(&upper, "VALUES") {
         // find_sql_keyword 返回关键字起始位置；列段应以关键字前的 ) 结尾
-        // 需要确保 ) 在 ( 之后，否则说明 VALUES 在列括号之前（如 INSERT INTO t VALUES ...）
-        upper[..pos].rfind(')').filter(|&r| r > columns_start).unwrap_or(pos)
+        upper[..pos].rfind(')').unwrap_or(pos)
     } else if let Some(pos) = upper.find(" SELECT ") {
         pos
     } else if let Some(pos) = find_sql_keyword(&upper, "SELECT") {
-        upper[..pos].rfind(')').filter(|&r| r > columns_start).unwrap_or(pos)
+        upper[..pos].rfind(')').unwrap_or(pos)
     } else {
         return trimmed.to_string();
     };
-    // 确保 columns_start 在 insert_head_end 之前
+    // 没有显式列名（如 INSERT INTO t VALUES (1)），无需添加 ON DUPLICATE KEY UPDATE
     if columns_start >= insert_head_end {
         return trimmed.to_string();
     }
@@ -1184,10 +667,10 @@ pub fn find_sql_keyword(upper: &str, keyword: &str) -> Option<usize> {
     let kw_len = keyword.len();
     while let Some(pos) = upper[start..].find(keyword) {
         let abs_pos = start + pos;
-        let before_ok = abs_pos == 0 || {
-            let c = upper.as_bytes()[abs_pos - 1];
-            c.is_ascii_whitespace() || c == b')' || c == b'`'
-        };
+    let before_ok = abs_pos == 0 || {
+        let c = upper.as_bytes()[abs_pos - 1];
+        c.is_ascii_whitespace() || c == b')' || c == b'`' || c == b'('
+    };
         let after_idx = abs_pos + kw_len;
         let after_ok = after_idx >= upper.len() || {
             let c = upper.as_bytes()[after_idx];
@@ -1242,11 +725,6 @@ fn ensure_mysql_target_db(sql: &str, target_db: &str) -> String {
         ("TRUNCATE TABLE ", "TRUNCATE TABLE ".len()),
         ("DELETE FROM ", "DELETE FROM ".len()),
         ("UPDATE ", "UPDATE ".len()),
-        ("CREATE TABLE IF NOT EXISTS ", "CREATE TABLE IF NOT EXISTS ".len()),
-        ("CREATE TABLE ", "CREATE TABLE ".len()),
-        ("ALTER TABLE ", "ALTER TABLE ".len()),
-        ("DROP TABLE IF EXISTS ", "DROP TABLE IF EXISTS ".len()),
-        ("DROP TABLE ", "DROP TABLE ".len()),
     ];
 
     let (keyword, prefix_len) = match dml_prefixes
@@ -1348,6 +826,7 @@ fn update_progress(
                 total_rows,
                 imported_rows,
                 error_message,
+                errors: vec![],
             },
         );
     }
@@ -1381,10 +860,20 @@ pub async fn init_schema(
     converter.execute_ddl(&db_config, &target_db).await
 }
 
-/// 一次性初始化所有库的表结构
+/// 获取单张表的字段和注释信息
+#[tauri::command]
+pub fn get_table_schema(
+    schema_dir: String,
+    target_db: String,
+    table_name: String,
+) -> Result<TableSchemaInfo, String> {
+    let converter = DdlConverter::new(PathBuf::from(schema_dir));
+    converter.get_table_schema(&target_db, &table_name)
+}
+
+/// 一键初始化所有 Schema 目录下的数据库表结构
 #[tauri::command]
 pub async fn init_all_schemas(
-    app_handle: tauri::AppHandle,
     state: State<'_, AppState>,
     db_config_id: String,
     schema_dir: String,
@@ -1398,29 +887,275 @@ pub async fn init_all_schemas(
             .ok_or_else(|| "未找到数据库配置".to_string())?
     };
 
-    let converter = DdlConverter::new(PathBuf::from(schema_dir));
+    let converter = DdlConverter::new(PathBuf::from(&schema_dir));
     let targets = converter.list_schema_targets()?;
+
     let mut results = Vec::new();
+    results.push(format!(
+        "开始初始化 {} 个库的表结构...",
+        targets.len()
+    ));
 
     for target in &targets {
-        let _ = app_handle.emit("schema-log", format!("▶ 开始初始化 [{}]", target.target_db.to_uppercase()));
+        results.push(format!("-- 初始化库: {} --", target.target_db));
         match converter.execute_ddl(&db_config, &target.target_db).await {
-            Ok(msg) => {
-                let log_lines: Vec<&str> = msg.lines().collect();
-                for line in log_lines {
-                    let _ = app_handle.emit("schema-log", line.to_string());
-                }
-                results.push(format!("[{}] {}", target.target_db.to_uppercase(), msg));
+            Ok(log) => {
+                results.push(log);
             }
             Err(e) => {
-                let _ = app_handle.emit("schema-log", format!("✗ [{}] 失败: {}", target.target_db.to_uppercase(), e));
-                results.push(format!("[{}] 失败: {}", target.target_db.to_uppercase(), e));
+                results.push(format!("✗ 库 {} 初始化失败: {}", target.target_db, e));
             }
         }
     }
 
-    let _ = app_handle.emit("schema-log", "══════ 初始化完成 ══════");
-
-    Ok(results.join("\n\n"))
+    results.push("所有库初始化完成".to_string());
+    Ok(results.join("\n"))
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{
+        find_sql_keyword, import_target_table, prepare_sql_statements, read_csv_data,
+        read_sql_data,
+    };
+    use crate::db::DbValue;
+    use crate::models::{CsvFileInfo, DbType, ImportFileType};
+    use std::fs;
+
+    #[test]
+    fn reads_empty_csv_fields_as_null_values() {
+        let file = std::env::temp_dir().join(format!(
+            "base-import-tool-null-csv-{}.csv",
+            std::process::id()
+        ));
+        fs::write(&file, "id,kc_order,name\n1,,分类\n").unwrap();
+
+        let data = read_csv_data(file.to_str().unwrap()).unwrap();
+
+        assert_eq!(data.columns, vec!["id", "kc_order", "name"]);
+        assert_eq!(
+            data.rows[0],
+            vec![
+                DbValue::Text("1".to_string()),
+                DbValue::Null,
+                DbValue::Text("分类".to_string())
+            ]
+        );
+
+        let _ = fs::remove_file(file);
+    }
+
+    #[test]
+    fn builds_import_target_table_from_csv_database_folder() {
+        let csv_file = CsvFileInfo {
+            file_name: "attribute_dict.csv".to_string(),
+            file_path: "/data/drug_spec/attribute_dict.csv".to_string(),
+            file_type: ImportFileType::Csv,
+            target_db: "drug_spec".to_string(),
+            table_name: "attribute_dict".to_string(),
+            row_count: None,
+            columns: vec!["id".to_string()],
+        };
+
+        let table = import_target_table(&csv_file);
+
+        assert_eq!(table.schema, "drug_spec");
+        assert_eq!(table.table_name, "attribute_dict");
+    }
+
+    #[test]
+    fn reads_sql_file_content_for_import() {
+        let file = std::env::temp_dir().join(format!(
+            "base-import-tool-import-sql-{}.sql",
+            std::process::id()
+        ));
+        fs::write(&file, "insert into cbs.sys_user(id) values (1);").unwrap();
+
+        let sql = read_sql_data(file.to_str().unwrap()).unwrap();
+
+        assert_eq!(sql, "insert into cbs.sys_user(id) values (1);");
+
+        let _ = fs::remove_file(file);
+    }
+
+    #[test]
+    fn prepares_mysql_sql_statements_from_oracle_style_script() {
+        let script = r#"
+INSERT INTO "CBS"."DICT_ADM_ROUTE" ("ADMIN_NAME", "ENGLISH_NAME") VALUES ('门诊', 'OUTPATIENT');
+INSERT INTO "CBS"."DICT_ADM_ROUTE" ("ADMIN_NAME") VALUES ('急诊');
+"#;
+
+        let statements = prepare_sql_statements(script, &DbType::MySQL, "cbs");
+
+        assert_eq!(statements.len(), 2);
+        assert_eq!(
+            statements[0],
+            "INSERT INTO `cbs`.`dict_adm_route` (`admin_name`, `english_name`) VALUES ('门诊', 'OUTPATIENT') ON DUPLICATE KEY UPDATE `admin_name` = VALUES(`admin_name`), `english_name` = VALUES(`english_name`)"
+        );
+        assert_eq!(
+            statements[1],
+            "INSERT INTO `cbs`.`dict_adm_route` (`admin_name`) VALUES ('急诊') ON DUPLICATE KEY UPDATE `admin_name` = VALUES(`admin_name`)"
+        );
+    }
+
+    #[test]
+    fn prepares_postgres_sql_statements_from_oracle_style_script() {
+        let script = r#"INSERT INTO "CBS"."DICT_ADM_ROUTE" ("ADMIN_NAME") VALUES ('门诊');"#;
+
+        let statements = prepare_sql_statements(script, &DbType::PostgreSQL, "cbs");
+
+        assert_eq!(statements.len(), 1);
+        assert_eq!(
+            statements[0],
+            "INSERT INTO \"cbs\".\"dict_adm_route\" (\"admin_name\") VALUES ('门诊')"
+        );
+    }
+
+    #[test]
+    fn prepares_mysql_insert_select_with_duplicate_key_update() {
+        let script =
+            r#"INSERT INTO "CBS"."DICT_DOCTOR_TITLE" ("ID", "NAME") SELECT '1', '主任医师' FROM DUAL;"#;
+
+        let statements = prepare_sql_statements(script, &DbType::MySQL, "cbs");
+
+        assert_eq!(statements.len(), 1);
+        assert_eq!(
+            statements[0],
+            "INSERT INTO `cbs`.`dict_doctor_title` (`id`, `name`) SELECT '1', '主任医师' FROM DUAL ON DUPLICATE KEY UPDATE `id` = VALUES(`id`), `name` = VALUES(`name`)"
+        );
+    }
+
+    #[test]
+    fn prepares_mysql_insert_without_schema_using_target_db() {
+        let script = r#"INSERT INTO "DICT_DRUG_CATE" ("ID", "NAME") VALUES ('1', '西药');"#;
+
+        let statements = prepare_sql_statements(script, &DbType::MySQL, "cbs");
+
+        assert_eq!(statements.len(), 1);
+        assert_eq!(
+            statements[0],
+            "INSERT INTO `cbs`.`dict_drug_cate` (`id`, `name`) VALUES ('1', '西药') ON DUPLICATE KEY UPDATE `id` = VALUES(`id`), `name` = VALUES(`name`)"
+        );
+    }
+
+    #[test]
+    fn prepares_mysql_truncate_without_schema_using_target_db() {
+        let script = r#"TRUNCATE TABLE "DICT_DRUG_CATE";"#;
+
+        let statements = prepare_sql_statements(script, &DbType::MySQL, "cbs");
+
+        assert_eq!(statements.len(), 1);
+        assert_eq!(statements[0], "TRUNCATE TABLE `cbs`.`dict_drug_cate`");
+    }
+
+    #[test]
+    fn prepares_mysql_truncate_with_schema_keeps_prefix() {
+        let script = r#"TRUNCATE TABLE "CBS"."DICT_DRUG_CATE";"#;
+
+        let statements = prepare_sql_statements(script, &DbType::MySQL, "cbs");
+
+        assert_eq!(statements.len(), 1);
+        assert_eq!(statements[0], "TRUNCATE TABLE `cbs`.`dict_drug_cate`");
+    }
+
+    #[test]
+    fn prepares_mysql_delete_without_schema_using_target_db() {
+        let script = r#"DELETE FROM "DICT_DRUG_CATE";"#;
+
+        let statements = prepare_sql_statements(script, &DbType::MySQL, "cbs");
+
+        assert_eq!(statements.len(), 1);
+        assert_eq!(statements[0], "DELETE FROM `cbs`.`dict_drug_cate`");
+    }
+
+    #[test]
+    fn prepares_mysql_delete_with_schema_keeps_prefix() {
+        let script = r#"DELETE FROM "CBS"."DICT_DRUG_CATE" WHERE ID = '1';"#;
+
+        let statements = prepare_sql_statements(script, &DbType::MySQL, "cbs");
+
+        assert_eq!(statements.len(), 1);
+        assert_eq!(
+            statements[0],
+            "DELETE FROM `cbs`.`dict_drug_cate` WHERE ID = '1'"
+        );
+    }
+
+    #[test]
+    fn prepares_mysql_update_without_schema_using_target_db() {
+        let script = r#"UPDATE "DICT_DRUG_CATE" SET NAME = 'test';"#;
+
+        let statements = prepare_sql_statements(script, &DbType::MySQL, "cbs");
+
+        assert_eq!(statements.len(), 1);
+        assert_eq!(
+            statements[0],
+            "UPDATE `cbs`.`dict_drug_cate` SET NAME = 'test'"
+        );
+    }
+
+    #[test]
+    fn preserves_non_dml_statements() {
+        let script = r#"SELECT 1 FROM DUAL;"#;
+
+        let statements = prepare_sql_statements(script, &DbType::MySQL, "cbs");
+
+        assert_eq!(statements.len(), 1);
+        assert_eq!(statements[0], "SELECT 1 FROM DUAL");
+    }
+
+    #[test]
+    fn handles_compact_values_format() {
+        // 紧凑格式：)VALUES(，VALUES 前无空格
+        let script = r#"INSERT INTO "CBS"."DICT_ADM_ROUTE" ("ADMIN_NAME")VALUES('膀胱冲洗用');"#;
+
+        let statements = prepare_sql_statements(script, &DbType::MySQL, "cbs");
+
+        assert_eq!(statements.len(), 1);
+        assert_eq!(
+            statements[0],
+            "INSERT INTO `cbs`.`dict_adm_route` (`admin_name`)VALUES('膀胱冲洗用') ON DUPLICATE KEY UPDATE `admin_name` = VALUES(`admin_name`)"
+        );
+    }
+
+    #[test]
+    fn handles_compact_values_format_with_trailing_space() {
+        // 紧凑格式：)VALUES (，VALUES 后紧跟空格和左括号
+        let script = r#"INSERT INTO "CBS"."DICT_ADM_ROUTE" ("ADMIN_NAME")VALUES ('膀胱冲洗用');"#;
+
+        let statements = prepare_sql_statements(script, &DbType::MySQL, "cbs");
+
+        assert_eq!(statements.len(), 1);
+        assert!(
+            statements[0].contains("ON DUPLICATE KEY UPDATE"),
+            "should add ON DUPLICATE KEY UPDATE for compact VALUES format"
+        );
+    }
+
+    #[test]
+    fn find_sql_keyword_finds_with_space_before() {
+        let upper = "INSERT INTO TBL (A) VALUES (1)";
+        assert_eq!(find_sql_keyword(upper, "VALUES"), Some(20));
+    }
+
+    #[test]
+    fn find_sql_keyword_finds_with_paren_before() {
+        let upper = "INSERT INTO TBL (A)VALUES (1)";
+        assert_eq!(find_sql_keyword(upper, "VALUES"), Some(19));
+    }
+
+    #[test]
+    fn find_sql_keyword_finds_with_backtick_before() {
+        let upper = "INSERT INTO `TBL` (`A`)VALUES (1)";
+        assert_eq!(find_sql_keyword(upper, "VALUES"), Some(23));
+    }
+
+    #[test]
+    fn find_sql_keyword_ignores_values_in_identifier() {
+        let upper = "INSERT INTO MY_VALUES_TABLE (A) VALUES (1)";
+        let pos = find_sql_keyword(upper, "VALUES").unwrap();
+        // 应该匹配第二个 VALUES (关键字)，而不是 MY_VALUES_TABLE 中的 VALUES
+        assert!(pos > 20, "should match keyword VALUES, not identifier prefix");
+        assert_eq!(pos, 32);
+    }
+}

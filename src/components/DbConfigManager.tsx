@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import type { DbConfig, DbType, ConnectionTestResult } from '../types';
+import type { DbConfig, DbType, OracleConnectionMode, ConnectionTestResult } from '../types';
 
 interface Props {
   dbConfigs: DbConfig[];
@@ -25,6 +25,7 @@ const emptyConfig = (): DbConfig => ({
   username: 'cbs',
   password: 'pdms',
   database: 'orcl',
+  oracle_connection_mode: 'ServiceName',
   extra_params: '',
 });
 
@@ -185,6 +186,55 @@ export default function DbConfigManager({
           />
         </div>
       </div>
+
+      {editing.db_type === 'Oracle' && (
+        <div className="form-row">
+          <div className="form-group">
+            <label>连接模式</label>
+            <select
+              value={editing.oracle_connection_mode || 'ServiceName'}
+              onChange={(e) =>
+                setEditing({
+                  ...editing,
+                  oracle_connection_mode: e.target.value as OracleConnectionMode,
+                })
+              }
+            >
+              <option value="ServiceName">Service Name</option>
+              <option value="SID">SID</option>
+            </select>
+          </div>
+          <div className="form-group">
+            <label>{editing.oracle_connection_mode === 'SID' ? 'SID' : 'Service Name'}</label>
+            <input
+              type="text"
+              value={editing.database}
+              onChange={(e) => setEditing({ ...editing, database: e.target.value })}
+              placeholder={editing.oracle_connection_mode === 'SID' ? '例如: ORCL' : '例如: orcl.example.com'}
+              autoCapitalize="none"
+              autoCorrect="off"
+              spellCheck={false}
+            />
+          </div>
+        </div>
+      )}
+
+      {editing.db_type !== 'Oracle' && editing.db_type !== 'DM' && (
+        <div className="form-row">
+          <div className="form-group">
+            <label>数据库名</label>
+            <input
+              type="text"
+              value={editing.database}
+              onChange={(e) => setEditing({ ...editing, database: e.target.value })}
+              placeholder="例如: mydb"
+              autoCapitalize="none"
+              autoCorrect="off"
+              spellCheck={false}
+            />
+          </div>
+        </div>
+      )}
 
       <div className="form-row">
         <div className="form-group">

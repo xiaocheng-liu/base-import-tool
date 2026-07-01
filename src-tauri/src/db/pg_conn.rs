@@ -1,7 +1,9 @@
-use super::{DbConnection, DbValue};
+use super::{format_db_error, DbConnection, DbValue};
 use crate::models::{ColumnInfo, ConnectionTestResult, DbConfig, IndexInfo, TableIdentifier};
 use async_trait::async_trait;
 use deadpool_postgres::{Config as PoolConfig, Pool, Runtime};
+use std::time::Duration;
+use tokio::time::timeout;
 use tokio_postgres::NoTls;
 
 pub struct PgConnection {
@@ -17,20 +19,22 @@ impl PgConnection {
         cfg.user = Some(config.username.clone());
         cfg.password = Some(config.password.clone());
         cfg.dbname = Some(config.database.clone());
+        // TCP 连接超时 10s
+        cfg.connect_timeout = Some(Duration::from_secs(10));
 
         let pool = cfg
             .create_pool(Some(Runtime::Tokio1), NoTls)
-            .map_err(|e| format!("创建 PostgreSQL 连接池失败: {}", e))?;
+            .map_err(|e| format_db_error("创建 PostgreSQL 连接池失败", e))?;
 
-        // 测试连接
-        let client = pool
-            .get()
+        // 测试连接（带 10s 超时）
+        let client = timeout(Duration::from_secs(10), pool.get())
             .await
-            .map_err(|e| format!("连接 PostgreSQL 失败: {}", e))?;
+            .map_err(|_| "连接 PostgreSQL 超时 (10s)".to_string())?
+            .map_err(|e| format_db_error("连接 PostgreSQL 失败", e))?;
         client
             .simple_query("SELECT 1")
             .await
-            .map_err(|e| format!("PostgreSQL 测试查询失败: {}", e))?;
+            .map_err(|e| format_db_error("PostgreSQL 测试查询失败", e))?;
 
         Ok(PgConnection {
             pool,
@@ -64,7 +68,7 @@ impl DbConnection for PgConnection {
             .pool
             .get()
             .await
-            .map_err(|e| format!("获取 PG 连接失败: {}", e))?;
+            .map_err(|e| format_db_error("获取 PG 连接失败", e))?;
 
         let col_names: Vec<String> = columns
             .iter()
@@ -84,7 +88,7 @@ impl DbConnection for PgConnection {
         let stmt = client
             .prepare(&sql)
             .await
-            .map_err(|e| format!("准备 PG 插入语句失败: {}", e))?;
+            .map_err(|e| format_db_error("准备 PG 插入语句失败", e))?;
 
         let mut inserted = 0;
         for row in &rows {
@@ -99,7 +103,7 @@ impl DbConnection for PgConnection {
             client
                 .execute(&stmt, &params)
                 .await
-                .map_err(|e| format!("PG 插入数据失败: {}", e))?;
+                .map_err(|e| format_db_error("PG 插入数据失败", e))?;
             inserted += 1;
         }
 
@@ -111,7 +115,7 @@ impl DbConnection for PgConnection {
             .pool
             .get()
             .await
-            .map_err(|e| format!("获取 PG 连接失败: {}", e))?;
+            .map_err(|e| format_db_error("获取 PG 连接失败", e))?;
         let schema = effective_schema(&table.schema, &self.schema);
         let rows = client
             .query(
@@ -119,7 +123,7 @@ impl DbConnection for PgConnection {
                 &[&schema, &table.table_name.to_lowercase()],
             )
             .await
-            .map_err(|e| format!("PG 查询表存在性失败: {}", e))?;
+            .map_err(|e| format_db_error("PG 查询表存在性失败", e))?;
 
         let count: i64 = rows.first().map(|r| r.get(0)).unwrap_or(0);
         Ok(count > 0)
@@ -130,7 +134,7 @@ impl DbConnection for PgConnection {
             .pool
             .get()
             .await
-            .map_err(|e| format!("获取 PG 连接失败: {}", e))?;
+            .map_err(|e| format_db_error("获取 PG 连接失败", e))?;
         let schema = effective_schema(&table.schema, &self.schema);
         let rows = client
             .query(
@@ -138,7 +142,7 @@ impl DbConnection for PgConnection {
                 &[&schema, &table.table_name.to_lowercase()],
             )
             .await
-            .map_err(|e| format!("PG 查询字段失败: {}", e))?;
+            .map_err(|e| format_db_error("PG 查询字段失败", e))?;
 
         Ok(rows
             .iter()
@@ -157,7 +161,7 @@ impl DbConnection for PgConnection {
             .pool
             .get()
             .await
-            .map_err(|e| format!("获取 PG 连接失败: {}", e))?;
+            .map_err(|e| format_db_error("获取 PG 连接失败", e))?;
         let schema = effective_schema(&table.schema, &self.schema);
         let rows = client
             .query(
@@ -165,7 +169,7 @@ impl DbConnection for PgConnection {
                 &[&schema, &table.table_name.to_lowercase()],
             )
             .await
-            .map_err(|e| format!("PG 查询索引失败: {}", e))?;
+            .map_err(|e| format_db_error("PG 查询索引失败", e))?;
 
         let mut indexes: Vec<IndexInfo> = Vec::new();
         for row in rows {
@@ -190,11 +194,11 @@ impl DbConnection for PgConnection {
             .pool
             .get()
             .await
-            .map_err(|e| format!("获取 PG 连接失败: {}", e))?;
+            .map_err(|e| format_db_error("获取 PG 连接失败", e))?;
         let rows = client
             .query("SELECT version()", &[])
             .await
-            .map_err(|e| format!("获取 PG 版本失败: {}", e))?;
+            .map_err(|e| format_db_error("获取 PG 版本失败", e))?;
 
         Ok(rows
             .first()
@@ -207,11 +211,11 @@ impl DbConnection for PgConnection {
             .pool
             .get()
             .await
-            .map_err(|e| format!("获取 PG 连接失败: {}", e))?;
+            .map_err(|e| format_db_error("获取 PG 连接失败", e))?;
         client
             .batch_execute(sql)
             .await
-            .map_err(|e| format!("PostgreSQL 执行 SQL 失败: {}", e))?;
+            .map_err(|e| format_db_error("PostgreSQL 执行 SQL 失败", e))?;
         Ok(())
     }
 }

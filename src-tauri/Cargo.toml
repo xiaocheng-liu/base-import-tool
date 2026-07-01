@@ -36,8 +36,11 @@ deadpool-postgres = "0.14"
 # MySQL 数据库驱动
 sqlx = { version = "0.8", features = ["runtime-tokio", "mysql"] }
 
-# 达梦数据库驱动 (通过 ODBC 方式, 需要安装达梦 ODBC 驱动和 unixODBC)
-odbc-api = { version = "8", features = ["narrow"] }
+# 达梦数据库驱动 (纯 Rust 原生驱动, 无需 ODBC)
+dameng = "0.1"
+
+# 字符编码转换（用于 Windows 国产数据库 GBK 错误信息转 UTF-8）
+encoding_rs = "0.8"
 
 # 日志
 log = "0.4"

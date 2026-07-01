@@ -1,4 +1,5 @@
 export type DbType = 'Oracle' | 'DM' | 'PostgreSQL' | 'MySQL';
+export type OracleConnectionMode = 'ServiceName' | 'SID';
 export type ImportFileType = 'Csv' | 'Sql';
 export type TargetDb =
   | 'cbs'
@@ -31,6 +32,7 @@ export interface DbConfig {
   username: string;
   password: string;
   database: string;
+  oracle_connection_mode?: OracleConnectionMode;
   extra_params: string;
 }
 
@@ -43,6 +45,8 @@ export interface ImportTask {
   total_rows: number;
   imported_rows: number;
   error_message: string | null;
+  /** 失败 SQL 列表（每条独立展示，含完整 SQL） */
+  errors?: SqlErrorItem[];
 }
 
 export interface ImportProgress {
@@ -52,6 +56,19 @@ export interface ImportProgress {
   total_rows: number;
   imported_rows: number;
   error_message: string | null;
+  /** 失败 SQL 列表（每条独立展示，含完整 SQL） */
+  errors?: SqlErrorItem[];
+}
+
+export interface SqlErrorItem {
+  /** 第几条 SQL（从 1 开始） */
+  index: number;
+  /** 错误简述 */
+  error: string;
+  /** 完整出错的 SQL 语句 */
+  sql: string;
+  /** 解决建议（可选） */
+  suggestion?: string | null;
 }
 
 export interface ConnectionTestResult {

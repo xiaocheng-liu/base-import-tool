@@ -251,7 +251,7 @@ export default function SchemaInit({ dbConfigs, selectedDbConfigId}: Props) {
             {logs.map((line, i) => (
               <div
                 key={i}
-                className={`schema-log-line ${line.startsWith('✗') ? 'log-error' : line.startsWith('✓') ? 'log-success' : line.startsWith('▶') ? 'log-header' : line.startsWith('═') ? 'log-footer' : ''}`}
+                className={`schema-log-line ${line.startsWith('✗') ? 'log-error' : line.startsWith('✓') ? 'log-success' : line.startsWith('▶') ? 'log-header' : line.startsWith('═') ? 'log-footer' : line.startsWith('初始化完成') ? 'log-summary' : ''}`}
               >
                 {line}
               </div>

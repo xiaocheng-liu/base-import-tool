@@ -24,6 +24,8 @@ export default function ImportManager({
   const [truncateFirst, setTruncateFirst] = useState(false);
   const [logs, setLogs] = useState<string[]>([]);
   const [schemaDir, setSchemaDir] = useState('');
+  // 失败项展开状态：key=taskId-errorIndex，true=展开
+  const [expandedErrors, setExpandedErrors] = useState<Record<string, boolean>>({});
   const logEndRef = useRef<HTMLDivElement>(null);
   const logContainerRef = useRef<HTMLDivElement>(null);
   const userScrolledUpRef = useRef(false);
@@ -98,6 +100,7 @@ export default function ImportManager({
               total_rows: p.total_rows,
               imported_rows: p.imported_rows,
               error_message: p.error_message,
+              errors: p.errors ?? task.errors,
             };
           }
           return task;
@@ -163,7 +166,6 @@ export default function ImportManager({
       const result: ImportTask[] = await invoke('start_import', {
         csvFiles: selectedCsvFiles,
         dbConfigId: selectedConfig.id,
-        truncateFirst,
       });
       setTasks(result);
     } catch (e: any) {
@@ -442,8 +444,66 @@ export default function ImportManager({
                 </div>
               )}
 
-              {task.status === 'Failed' && task.error_message && (
-                <div className="task-error">{task.error_message}</div>
+              {task.status === 'Failed' && (task.errors?.length || task.error_message) && (
+                <div className="task-errors">
+                  {task.errors && task.errors.length > 0 && (
+                    <>
+                      <div className="task-errors-header">
+                        共 {task.errors.length} 条 SQL 执行失败：
+                      </div>
+                      <div className="task-errors-list">
+                        {task.errors.map((err, i) => {
+                          const key = `${task.id}-${err.index}`;
+                          // 默认展开（首次出现时默认 true）
+                          const isOpen = expandedErrors[key] ?? true;
+                          return (
+                            <div
+                              key={key}
+                              className={`task-error-item ${isOpen ? 'is-open' : 'is-collapsed'}`}
+                            >
+                              <div
+                                className="task-error-item-header"
+                                onClick={() =>
+                                  setExpandedErrors((prev) => ({ ...prev, [key]: !isOpen }))
+                                }
+                                role="button"
+                                aria-expanded={isOpen}
+                                tabIndex={0}
+                                onKeyDown={(e) => {
+                                  if (e.key === 'Enter' || e.key === ' ') {
+                                    e.preventDefault();
+                                    setExpandedErrors((prev) => ({ ...prev, [key]: !isOpen }));
+                                  }
+                                }}
+                              >
+                                <span className="task-error-index">第 {err.index} 条</span>
+                                <span className="task-error-toggle" aria-hidden>
+                                  {isOpen ? '▾' : '▸'}
+                                </span>
+                              </div>
+                              {isOpen && (
+                                <div className="task-error-item-body">
+                                  <div className="task-error-msg">{err.error}</div>
+                                  <div className="task-error-sql-label">出错 SQL（完整）：</div>
+                                  <pre className="task-error-sql">{err.sql}</pre>
+                                  {err.suggestion && (
+                                    <div className="task-error-suggestion">
+                                      <div className="task-error-suggestion-title">解决建议：</div>
+                                      <pre className="task-error-suggestion-body">{err.suggestion}</pre>
+                                    </div>
+                                  )}
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </>
+                  )}
+                  {(!task.errors || task.errors.length === 0) && task.error_message && (
+                    <div className="task-error">{task.error_message}</div>
+                  )}
+                </div>
               )}
             </div>
           ))}

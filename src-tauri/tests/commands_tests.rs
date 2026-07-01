@@ -68,7 +68,7 @@ INSERT INTO "CBS"."DICT_ADM_ROUTE" ("ADMIN_NAME", "ENGLISH_NAME") VALUES ('门�
 INSERT INTO "CBS"."DICT_ADM_ROUTE" ("ADMIN_NAME") VALUES ('急诊');
 "#;
 
-    let statements = prepare_sql_statements(script, &DbType::MySQL, "cbs", false);
+    let statements = prepare_sql_statements(script, &DbType::MySQL, "cbs");
 
     assert_eq!(statements.len(), 2);
     assert_eq!(
@@ -85,7 +85,7 @@ INSERT INTO "CBS"."DICT_ADM_ROUTE" ("ADMIN_NAME") VALUES ('急诊');
 fn prepares_postgres_sql_statements_from_oracle_style_script() {
     let script = r#"INSERT INTO "CBS"."DICT_ADM_ROUTE" ("ADMIN_NAME") VALUES ('门诊');"#;
 
-    let statements = prepare_sql_statements(script, &DbType::PostgreSQL, "cbs", false);
+    let statements = prepare_sql_statements(script, &DbType::PostgreSQL, "cbs");
 
     assert_eq!(statements.len(), 1);
     assert_eq!(
@@ -99,7 +99,7 @@ fn prepares_mysql_insert_select_with_duplicate_key_update() {
     let script =
         r#"INSERT INTO "CBS"."DICT_DOCTOR_TITLE" ("ID", "NAME") SELECT '1', '主任医师' FROM DUAL;"#;
 
-    let statements = prepare_sql_statements(script, &DbType::MySQL, "cbs", false);
+    let statements = prepare_sql_statements(script, &DbType::MySQL, "cbs");
 
     assert_eq!(statements.len(), 1);
     assert_eq!(
@@ -112,7 +112,7 @@ fn prepares_mysql_insert_select_with_duplicate_key_update() {
 fn prepares_mysql_insert_without_schema_using_target_db() {
     let script = r#"INSERT INTO "DICT_DRUG_CATE" ("ID", "NAME") VALUES ('1', '西药');"#;
 
-    let statements = prepare_sql_statements(script, &DbType::MySQL, "cbs", false);
+    let statements = prepare_sql_statements(script, &DbType::MySQL, "cbs");
 
     assert_eq!(statements.len(), 1);
     assert_eq!(
@@ -125,7 +125,7 @@ fn prepares_mysql_insert_without_schema_using_target_db() {
 fn prepares_mysql_truncate_without_schema_using_target_db() {
     let script = r#"TRUNCATE TABLE "DICT_DRUG_CATE";"#;
 
-    let statements = prepare_sql_statements(script, &DbType::MySQL, "cbs", false);
+    let statements = prepare_sql_statements(script, &DbType::MySQL, "cbs");
 
     assert_eq!(statements.len(), 1);
     assert_eq!(statements[0], "TRUNCATE TABLE `cbs`.`dict_drug_cate`");
@@ -135,7 +135,7 @@ fn prepares_mysql_truncate_without_schema_using_target_db() {
 fn prepares_mysql_truncate_with_schema_keeps_prefix() {
     let script = r#"TRUNCATE TABLE "CBS"."DICT_DRUG_CATE";"#;
 
-    let statements = prepare_sql_statements(script, &DbType::MySQL, "cbs", false);
+    let statements = prepare_sql_statements(script, &DbType::MySQL, "cbs");
 
     assert_eq!(statements.len(), 1);
     assert_eq!(statements[0], "TRUNCATE TABLE `cbs`.`dict_drug_cate`");
@@ -145,7 +145,7 @@ fn prepares_mysql_truncate_with_schema_keeps_prefix() {
 fn prepares_mysql_delete_without_schema_using_target_db() {
     let script = r#"DELETE FROM "DICT_DRUG_CATE";"#;
 
-    let statements = prepare_sql_statements(script, &DbType::MySQL, "cbs", false);
+    let statements = prepare_sql_statements(script, &DbType::MySQL, "cbs");
 
     assert_eq!(statements.len(), 1);
     assert_eq!(statements[0], "DELETE FROM `cbs`.`dict_drug_cate`");
@@ -155,7 +155,7 @@ fn prepares_mysql_delete_without_schema_using_target_db() {
 fn prepares_mysql_delete_with_schema_keeps_prefix() {
     let script = r#"DELETE FROM "CBS"."DICT_DRUG_CATE" WHERE ID = '1';"#;
 
-    let statements = prepare_sql_statements(script, &DbType::MySQL, "cbs", false);
+    let statements = prepare_sql_statements(script, &DbType::MySQL, "cbs");
 
     assert_eq!(statements.len(), 1);
     assert_eq!(
@@ -168,7 +168,7 @@ fn prepares_mysql_delete_with_schema_keeps_prefix() {
 fn prepares_mysql_update_without_schema_using_target_db() {
     let script = r#"UPDATE "DICT_DRUG_CATE" SET NAME = 'test';"#;
 
-    let statements = prepare_sql_statements(script, &DbType::MySQL, "cbs", false);
+    let statements = prepare_sql_statements(script, &DbType::MySQL, "cbs");
 
     assert_eq!(statements.len(), 1);
     assert_eq!(
@@ -181,7 +181,7 @@ fn prepares_mysql_update_without_schema_using_target_db() {
 fn preserves_non_dml_statements() {
     let script = r#"SELECT 1 FROM DUAL;"#;
 
-    let statements = prepare_sql_statements(script, &DbType::MySQL, "cbs", false);
+    let statements = prepare_sql_statements(script, &DbType::MySQL, "cbs");
 
     assert_eq!(statements.len(), 1);
     assert_eq!(statements[0], "SELECT 1 FROM DUAL");
@@ -192,7 +192,7 @@ fn handles_compact_values_format() {
     // 紧凑格式：)VALUES(，VALUES 前无空格
     let script = r#"INSERT INTO "CBS"."DICT_ADM_ROUTE" ("ADMIN_NAME")VALUES('膀胱冲洗用');"#;
 
-    let statements = prepare_sql_statements(script, &DbType::MySQL, "cbs", false);
+    let statements = prepare_sql_statements(script, &DbType::MySQL, "cbs");
 
     assert_eq!(statements.len(), 1);
     assert_eq!(
@@ -206,7 +206,7 @@ fn handles_compact_values_format_with_trailing_space() {
     // 紧凑格式：)VALUES (，VALUES 后紧跟空格和左括号
     let script = r#"INSERT INTO "CBS"."DICT_ADM_ROUTE" ("ADMIN_NAME")VALUES ('膀胱冲洗用');"#;
 
-    let statements = prepare_sql_statements(script, &DbType::MySQL, "cbs", false);
+    let statements = prepare_sql_statements(script, &DbType::MySQL, "cbs");
 
     assert_eq!(statements.len(), 1);
     assert!(
@@ -246,7 +246,7 @@ fn find_sql_keyword_ignores_values_in_identifier() {
 fn converts_oracle_to_date_to_mysql_str_to_date() {
     let sql = r#"INSERT INTO "CBS"."DICT_DRUG_CATE" ("ID", "NAME", "CREATE_TIME", "MODIFY_TIME", "DC_STATUS") VALUES ('0801335e36094bad8fd22096a0ac6dc0', '生物制品-细胞因子', TO_DATE('2025-05-16 09:41:01', 'YYYY-MM-DD HH24:MI:SS'), TO_DATE('2025-05-16 09:41:01', 'YYYY-MM-DD HH24:MI:SS'), 1);"#;
 
-    let statements = prepare_sql_statements(sql, &DbType::MySQL, "cbs", false);
+    let statements = prepare_sql_statements(sql, &DbType::MySQL, "cbs");
 
     assert_eq!(statements.len(), 1);
     assert!(
@@ -275,7 +275,7 @@ fn converts_oracle_to_date_to_mysql_str_to_date() {
 fn converts_oracle_to_date_to_pg_to_timestamp() {
     let sql = r#"INSERT INTO "CBS"."DICT_DRUG_CATE" ("ID", "NAME", "CREATE_TIME") VALUES ('id1', 'test', TO_DATE('2025-05-16 09:41:01', 'YYYY-MM-DD HH24:MI:SS'));"#;
 
-    let statements = prepare_sql_statements(sql, &DbType::PostgreSQL, "cbs", false);
+    let statements = prepare_sql_statements(sql, &DbType::PostgreSQL, "cbs");
 
     assert_eq!(statements.len(), 1);
     assert!(
@@ -301,7 +301,7 @@ fn converts_oracle_to_date_to_pg_to_timestamp() {
 fn does_not_convert_to_date_for_oracle_target() {
     let sql = r#"INSERT INTO "CBS"."DICT_DRUG_CATE" ("CREATE_TIME") VALUES (TO_DATE('2025-05-16', 'YYYY-MM-DD'));"#;
 
-    let statements = prepare_sql_statements(sql, &DbType::Oracle, "cbs", false);
+    let statements = prepare_sql_statements(sql, &DbType::Oracle, "cbs");
 
     assert_eq!(statements.len(), 1);
     assert!(
@@ -314,7 +314,7 @@ fn does_not_convert_to_date_for_oracle_target() {
 fn converts_multiple_to_date_in_single_statement() {
     let sql = r#"INSERT INTO TBL (A, B) VALUES (TO_DATE('2025-01-01', 'YYYY-MM-DD'), TO_DATE('2025-06-28', 'YYYY-MM-DD'));"#;
 
-    let statements = prepare_sql_statements(sql, &DbType::MySQL, "cbs", false);
+    let statements = prepare_sql_statements(sql, &DbType::MySQL, "cbs");
 
     assert_eq!(statements.len(), 1);
     let stmt = &statements[0];
@@ -326,17 +326,13 @@ fn converts_multiple_to_date_in_single_statement() {
 fn filters_trailing_export_count_comment() {
     // 测试 Oracle 类型（不做 MySQL 特殊处理）
     let script = "INSERT INTO t VALUES (1);\nINSERT INTO t VALUES (2);\n-- 共导出 2 条记录";
-    let statements = prepare_sql_statements(script, &DbType::Oracle, "test_db", false);
+    let statements = prepare_sql_statements(script, &DbType::Oracle, "test_db");
     assert_eq!(statements.len(), 2, "should filter out trailing comment line for Oracle");
 
-    let statements = prepare_sql_statements(script, &DbType::PostgreSQL, "test_db", false);
+    let statements = prepare_sql_statements(script, &DbType::PostgreSQL, "test_db");
     assert_eq!(statements.len(), 2, "should filter out trailing comment line for PostgreSQL");
 
-    // MySQL truncate_first=true 时也应正确过滤
-    let statements = prepare_sql_statements(script, &DbType::MySQL, "test_db", true);
-    assert_eq!(statements.len(), 2, "should filter out trailing comment line for MySQL (truncate)");
-
-    // MySQL truncate_first=false 时也应正确过滤（之前会 panic）
-    let statements = prepare_sql_statements(script, &DbType::MySQL, "test_db", false);
-    assert_eq!(statements.len(), 2, "should filter out trailing comment line for MySQL (no truncate)");
+    // MySQL 时也应正确过滤
+    let statements = prepare_sql_statements(script, &DbType::MySQL, "test_db");
+    assert_eq!(statements.len(), 2, "should filter out trailing comment line for MySQL");
 }

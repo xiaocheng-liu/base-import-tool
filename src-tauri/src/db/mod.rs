@@ -1,4 +1,5 @@
 pub mod dm_conn;
+pub mod encoding;
 pub mod mysql_conn;
 pub mod oracle_conn;
 pub mod pg_conn;
@@ -7,6 +8,9 @@ use crate::models::{
     ColumnInfo, ConnectionTestResult, DbConfig, DbType, IndexInfo, TableIdentifier,
 };
 use async_trait::async_trait;
+
+/// 引入 encoding 工具，方便 db 子模块使用。
+pub use encoding::{format_db_error, normalize_db_error};
 
 /// 导入时使用的数据库值，CSV 空字段按 NULL 处理。
 #[derive(Debug, Clone, PartialEq)]
