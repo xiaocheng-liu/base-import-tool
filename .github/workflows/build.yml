@@ -83,6 +83,9 @@ jobs:
           node-version: 24
       - uses: dtolnay/rust-toolchain@stable
 
+      - name: Add x86_64-apple-darwin target
+        run: rustup target add x86_64-apple-darwin
+
       - name: Install system dependencies (macOS)
         run: brew install unixodbc
 
