@@ -452,7 +452,7 @@ export default function ImportManager({
                         共 {task.errors.length} 条 SQL 执行失败：
                       </div>
                       <div className="task-errors-list">
-                        {task.errors.map((err, i) => {
+                        {task.errors.map((err, _i) => {
                           const key = `${task.id}-${err.index}`;
                           // 默认展开（首次出现时默认 true）
                           const isOpen = expandedErrors[key] ?? true;

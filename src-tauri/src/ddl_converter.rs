@@ -310,8 +310,8 @@ impl DdlConverter {
         let upper = part.to_uppercase();
 
         // 提取列名（引号包裹的）
-        let name_end = if part.starts_with('"') {
-            part[1..].find('"').map(|i| i + 2)?
+        let name_end = if let Some(stripped) = part.strip_prefix('"') {
+            stripped.find('"').map(|i| i + 2)?
         } else {
             part.find(' ')?
         };
@@ -663,14 +663,12 @@ impl DdlConverter {
                                 parts[0].trim().replace('*', "38").parse().unwrap_or(10);
                             if scale > 0 {
                                 format!("NUMERIC({}, {})", precision, scale)
+                            } else if precision <= 4 {
+                                "SMALLINT".to_string()
+                            } else if precision <= 9 {
+                                "INT".to_string()
                             } else {
-                                if precision <= 4 {
-                                    "SMALLINT".to_string()
-                                } else if precision <= 9 {
-                                    "INT".to_string()
-                                } else {
-                                    "BIGINT".to_string()
-                                }
+                                "BIGINT".to_string()
                             }
                         } else {
                             "BIGINT".to_string()

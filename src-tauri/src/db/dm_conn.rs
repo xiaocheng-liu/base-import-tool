@@ -121,7 +121,7 @@ impl DbConnection for DMConnection {
             let rs = client
                 .query(&sql)
                 .map_err(|e| format_db_error("达梦查询表存在性失败", e))?;
-            for row in rs.iter() {
+            if let Some(row) = rs.iter().next() {
                 let count: i64 = row.get(0).unwrap_or(0);
                 return Ok(count > 0);
             }

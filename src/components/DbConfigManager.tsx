@@ -49,6 +49,7 @@ export default function DbConfigManager({
         setSelectedDbConfigId(dbConfigs[0].id);
       }
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [dbConfigs.length]);
 
   const handleSave = async () => {

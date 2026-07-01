@@ -21,13 +21,14 @@ impl std::fmt::Display for DbType {
 }
 
 /// 目标数据库。
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub enum TargetDb {
     #[serde(rename = "cbs")]
     Cbs,
     #[serde(rename = "clin_wkst")]
     ClinWkst,
     #[serde(rename = "kbe")]
+    #[default]
     Kbe,
     #[serde(rename = "drug_spec")]
     DrugSpec,
@@ -147,16 +148,11 @@ pub struct CsvFileInfo {
 }
 
 /// Oracle 连接模式
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub enum OracleConnectionMode {
+    #[default]
     ServiceName,
     SID,
-}
-
-impl Default for OracleConnectionMode {
-    fn default() -> Self {
-        OracleConnectionMode::ServiceName
-    }
 }
 
 /// 数据库连接配置
@@ -174,12 +170,6 @@ pub struct DbConfig {
     #[serde(default)]
     pub oracle_connection_mode: OracleConnectionMode,
     pub extra_params: String, // 额外连接参数
-}
-
-impl Default for TargetDb {
-    fn default() -> Self {
-        TargetDb::Kbe
-    }
 }
 
 /// 导入任务

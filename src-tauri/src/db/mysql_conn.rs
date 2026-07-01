@@ -84,8 +84,7 @@ impl DbConnection for MySqlConnection {
             .iter()
             .map(|c| format!("`{}`", c.to_lowercase()))
             .collect();
-        let placeholders: Vec<String> = std::iter::repeat("?".to_string())
-            .take(columns.len())
+        let placeholders: Vec<String> = std::iter::repeat_n("?".to_string(), columns.len())
             .collect();
 
         // 生成 ON DUPLICATE KEY UPDATE 子句，用于处理主键冲突

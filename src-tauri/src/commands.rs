@@ -130,7 +130,7 @@ pub async fn start_import(
     let tasks_for_spawn = tasks.clone();
     tokio::spawn(async move {
         for task in &tasks_for_spawn {
-            execute_import(&conn, task, &progress_map, &db_type).await;
+            execute_import(&*conn, task, &progress_map, &db_type).await;
         }
         // conn 在这里 drop，确保所有任务完成后才释放连接
     });
@@ -140,7 +140,7 @@ pub async fn start_import(
 
 /// 执行单个文件的导入
 async fn execute_import(
-    conn: &Box<dyn DbConnection>,
+    conn: &dyn DbConnection,
     task: &ImportTask,
     progress_map: &Arc<Mutex<HashMap<String, ImportProgress>>>,
     db_type: &DbType,
@@ -196,7 +196,7 @@ pub struct CsvData {
 }
 
 async fn execute_csv_import(
-    conn: &Box<dyn DbConnection>,
+    conn: &dyn DbConnection,
     task: &ImportTask,
     progress_map: &Arc<Mutex<HashMap<String, ImportProgress>>>,
 ) {
@@ -305,7 +305,7 @@ async fn execute_csv_import(
 }
 
 async fn execute_sql_import(
-    conn: &Box<dyn DbConnection>,
+    conn: &dyn DbConnection,
     task: &ImportTask,
     progress_map: &Arc<Mutex<HashMap<String, ImportProgress>>>,
     db_type: &DbType,
