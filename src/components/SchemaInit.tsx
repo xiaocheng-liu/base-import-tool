@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState } from 'react';
-import type { DbConfig, SchemaTarget } from '../types';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import type { DbConfig, SchemaTarget, SchemaInitProgress } from '../types';
 
 interface Props {
   dbConfigs: DbConfig[];
@@ -7,47 +7,48 @@ interface Props {
   setSelectedDbConfigId: (id: string) => void;
 }
 
-export default function SchemaInit({ dbConfigs, selectedDbConfigId}: Props) {
+/** 解析日志行所属的库 */
+function detectDbFromLogLine(line: string, dbNames: string[]): string | null {
+  // 1. 显式库分隔线："-- 初始化库: cbs --"
+  const sepMatch = line.match(/^--\s*初始化库:\s*(\w+)\s*--/);
+  if (sepMatch) return sepMatch[1].toLowerCase();
+  // 2. 失败/完成前缀："✗ 库 cbs 初始化失败: ..."
+  const libMatch = line.match(/^[✗×] 库 (\w+) /);
+  if (libMatch) return libMatch[1].toLowerCase();
+  // 3. 表/索引操作："  ▶ 表 CBS.xxx" / "  ▶ 创建索引 IDX ..."
+  const tableMatch = line.match(/(?:表|索引)\s+([A-Z_][A-Z0-9_]*)\./i);
+  if (tableMatch) {
+    const schema = tableMatch[1].toLowerCase();
+    // schema 名通常就是库名，或可通过 dbNames 反查
+    if (dbNames.includes(schema)) return schema;
+  }
+  return null;
+}
+
+function timestampLabel() {
+  const now = new Date();
+  return `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}_${String(now.getHours()).padStart(2, '0')}${String(now.getMinutes()).padStart(2, '0')}${String(now.getSeconds()).padStart(2, '0')}`;
+}
+
+export default function SchemaInit({ dbConfigs, selectedDbConfigId }: Props) {
   const [schemaTargets, setSchemaTargets] = useState<SchemaTarget[]>([]);
   const [schemaFolderPath, setSchemaFolderPath] = useState('');
   const [loading, setLoading] = useState(false);
   const [initializing, setInitializing] = useState(false);
   const [loadError, setLoadError] = useState('');
-  const [logs, setLogs] = useState<string[]>([]);
-  const logEndRef = useRef<HTMLDivElement>(null);
-  const logContainerRef = useRef<HTMLDivElement>(null);
-  const userScrolledUpRef = useRef(false);
+  const [globalLogs, setGlobalLogs] = useState<string[]>([]);
+  const [dbLogs, setDbLogs] = useState<Record<string, string[]>>({});
+  const [progressMap, setProgressMap] = useState<Record<string, SchemaInitProgress>>({});
+  const [expandedDbs, setExpandedDbs] = useState<Record<string, boolean>>({});
+  const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const taskIdsRef = useRef<string[]>([]);
+  const logEndRefs = useRef<Record<string, HTMLDivElement | null>>({});
+  const logContainerRefs = useRef<Record<string, HTMLDivElement | null>>({});
+  const userScrolledUpRefs = useRef<Record<string, boolean>>({});
 
-  const handleCopyLogs = () => {
-    const text = logs.join('\n');
-    navigator.clipboard.writeText(text).then(() => {
-    }).catch(() => {});
-  };
-
-  const handleExportLogs = () => {
-    const text = logs.join('\n');
-    const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    const now = new Date();
-    const ts = `${now.getFullYear()}${String(now.getMonth()+1).padStart(2,'0')}${String(now.getDate()).padStart(2,'0')}_${String(now.getHours()).padStart(2,'0')}${String(now.getMinutes()).padStart(2,'0')}${String(now.getSeconds()).padStart(2,'0')}`;
-    a.href = url;
-    a.download = `schema_init_log_${ts}.txt`;
-    a.click();
-    URL.revokeObjectURL(url);
-  };
+  const dbNames = useMemo(() => schemaTargets.map((t) => t.target_db.toLowerCase()), [schemaTargets]);
 
   const selectedConfig = dbConfigs.find((c) => c.id === selectedDbConfigId);
-
-  // 只有用户在底部附近时才自动滚动到底部，否则尊重用户的手动滚动位置
-  useEffect(() => {
-    const container = logContainerRef.current;
-    if (!container) return;
-    const isNearBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 60;
-    if (isNearBottom || !userScrolledUpRef.current) {
-      logEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-    }
-  }, [logs]);
 
   useEffect(() => {
     if (!schemaFolderPath) return;
@@ -84,7 +85,9 @@ export default function SchemaInit({ dbConfigs, selectedDbConfigId}: Props) {
 
       if (selected && typeof selected === 'string') {
         setSchemaFolderPath(selected);
-        setLogs([]);
+        setGlobalLogs([]);
+        setDbLogs({});
+        setExpandedDbs({});
       }
     } catch (e: any) {
       setLoadError(`选择 Schema 文件夹失败: ${e}`);
@@ -92,30 +95,62 @@ export default function SchemaInit({ dbConfigs, selectedDbConfigId}: Props) {
   };
 
   const handleClear = () => {
+    if (pollingRef.current) {
+      clearInterval(pollingRef.current);
+      pollingRef.current = null;
+    }
     setSchemaTargets([]);
     setSchemaFolderPath('');
     setLoadError('');
-    setLogs([]);
+    setGlobalLogs([]);
+    setDbLogs({});
+    setProgressMap({});
+    setExpandedDbs({});
+    setInitializing(false);
+  };
+
+  const appendDbLogs = (lines: string[]) => {
+    setDbLogs((prev) => {
+      const next: Record<string, string[]> = { ...prev };
+      let currentDb: string | null = null;
+      for (const line of lines) {
+        const detected = detectDbFromLogLine(line, dbNames);
+        if (detected) currentDb = detected;
+        if (currentDb) {
+          const arr = next[currentDb] ? [...next[currentDb]!] : [];
+          arr.push(line);
+          next[currentDb] = arr;
+        }
+      }
+      return next;
+    });
   };
 
   const handleInit = async () => {
     if (!selectedConfig || schemaTargets.length === 0) return;
     setInitializing(true);
-    setLogs([`开始初始化 ${schemaTargets.length} 个库的表结构...`]);
-    userScrolledUpRef.current = false;
+    setGlobalLogs([]);
+    setDbLogs({});
+    setProgressMap({});
+    userScrolledUpRefs.current = {};
+    // 默认全部展开，方便实时查看
+    const expandAll: Record<string, boolean> = {};
+    for (const t of schemaTargets) expandAll[t.target_db.toLowerCase()] = true;
+    setExpandedDbs(expandAll);
 
-    // 批量缓存日志，减少 setState 调用
     const logBuffer: string[] = [];
     let flushTimer: ReturnType<typeof setInterval> | null = null;
 
     const { listen } = await import('@tauri-apps/api/event');
-    const unlisten = await listen<string>('schema-log', (event) => {
-      logBuffer.push(event.payload);
+    const unlistenLog = await listen<string>('schema-log', (event) => {
+      const lines = event.payload.split('\n').filter((line) => line.length > 0);
+      logBuffer.push(...lines);
       if (!flushTimer) {
         flushTimer = setInterval(() => {
           if (logBuffer.length > 0) {
             const batch = logBuffer.splice(0);
-            setLogs((prev) => [...prev, ...batch]);
+            setGlobalLogs((prev) => [...prev, ...batch]);
+            appendDbLogs(batch);
           }
         }, 100);
       }
@@ -123,23 +158,132 @@ export default function SchemaInit({ dbConfigs, selectedDbConfigId}: Props) {
 
     try {
       const { invoke } = await import('@tauri-apps/api/core');
-      await invoke('init_all_schemas', {
+      const taskIds: string[] = await invoke('init_all_schemas', {
         dbConfigId: selectedConfig.id,
         schemaDir: schemaFolderPath,
       });
-      // 等待 flush 最后一批
-      await new Promise((r) => setTimeout(r, 200));
+      taskIdsRef.current = taskIds;
+
+      const pollProgress = async () => {
+        const currentIds = taskIdsRef.current;
+        if (currentIds.length === 0) return;
+        try {
+          const { invoke } = await import('@tauri-apps/api/core');
+          const progress: Record<string, SchemaInitProgress> = await invoke(
+            'get_schema_init_progress',
+            { targetDbs: currentIds }
+          );
+          setProgressMap(progress);
+
+          const allDone = currentIds.every((id) => {
+            const p = progress[id];
+            return p && (p.status === 'Completed' || p.status === 'Failed');
+          });
+          if (allDone) {
+            if (pollingRef.current) {
+              clearInterval(pollingRef.current);
+              pollingRef.current = null;
+            }
+            setTimeout(() => {
+              if (flushTimer) clearInterval(flushTimer);
+              if (logBuffer.length > 0) {
+                const batch = logBuffer.splice(0);
+                setGlobalLogs((prev) => [...prev, ...batch]);
+                appendDbLogs(batch);
+              }
+              unlistenLog();
+              setInitializing(false);
+            }, 300);
+          }
+        } catch (_) {
+          // 轮询失败静默处理
+        }
+      };
+
+      await pollProgress();
+      pollingRef.current = setInterval(pollProgress, 1000);
     } catch (e: any) {
-      setLogs((prev) => [...prev, `✗ 初始化失败: ${e}`]);
-    } finally {
       if (flushTimer) clearInterval(flushTimer);
       if (logBuffer.length > 0) {
         const batch = logBuffer.splice(0);
-        setLogs((prev) => [...prev, ...batch]);
+        setGlobalLogs((prev) => [...prev, ...batch]);
+        appendDbLogs(batch);
       }
-      unlisten();
+      unlistenLog();
+      if (pollingRef.current) {
+        clearInterval(pollingRef.current);
+        pollingRef.current = null;
+      }
+      setGlobalLogs((prev) => [...prev, `✗ 初始化失败: ${e}`]);
       setInitializing(false);
     }
+  };
+
+  const toggleDb = (db: string) => {
+    setExpandedDbs((prev) => ({ ...prev, [db]: !prev[db] }));
+  };
+
+  const copyDbLogs = (db: string) => {
+    const text = (dbLogs[db] || []).join('\n');
+    navigator.clipboard.writeText(text).catch(() => {});
+  };
+
+  const exportDbLogs = (db: string) => {
+    const text = (dbLogs[db] || []).join('\n');
+    const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `schema_init_${db}_${timestampLabel()}.txt`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const exportAllLogs = () => {
+    const text = globalLogs.join('\n');
+    const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `schema_init_all_${timestampLabel()}.txt`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const statusLabel = (status: string) => {
+    switch (status) {
+      case 'Running':
+        return '初始化中';
+      case 'Completed':
+        return '已完成';
+      case 'Failed':
+        return '失败';
+      default:
+        return '等待中';
+    }
+  };
+
+  const statusIcon = (status: string) => {
+    switch (status) {
+      case 'Completed':
+        return '✅';
+      case 'Failed':
+        return '❌';
+      case 'Running':
+        return '🔄';
+      default:
+        return '⏳';
+    }
+  };
+
+  const logLineClass = (line: string) => {
+    if (line.startsWith('✗') || line.startsWith('×')) return 'log-error';
+    if (line.startsWith('✓')) return 'log-success';
+    if (line.startsWith('▶')) return 'log-header';
+    if (line.startsWith('═')) return 'log-footer';
+    if (line.startsWith('初始化完成') || line.startsWith('-- 初始化库:')) return 'log-summary';
+    if (line.startsWith('    SQL:')) return 'log-sql';
+    return '';
   };
 
   if (!selectedConfig) {
@@ -190,7 +334,9 @@ export default function SchemaInit({ dbConfigs, selectedDbConfigId}: Props) {
         </button>
         {schemaFolderPath && (
           <>
-            <span className="folder-path" title={schemaFolderPath}>{schemaFolderPath}</span>
+            <span className="folder-path" title={schemaFolderPath}>
+              {schemaFolderPath}
+            </span>
             <button className="btn btn-sm btn-danger" onClick={handleClear}>
               清空
             </button>
@@ -199,14 +345,107 @@ export default function SchemaInit({ dbConfigs, selectedDbConfigId}: Props) {
       </div>
 
       {schemaTargets.length > 0 && (
-        <div className="schema-file-summary">
-          {schemaTargets.map((t) => (
-            <div key={t.target_db} className="schema-target-info">
-              <strong>{t.target_db.toUpperCase()}</strong>
-              <span className="schema-file-tag">{t.tables_file}</span>
-              <span className="schema-file-tag">{t.indexes_file}</span>
-            </div>
-          ))}
+        <div className="schema-module-list">
+          {schemaTargets.map((target) => {
+            const dbKey = target.target_db.toLowerCase();
+            const p = progressMap[dbKey];
+            const status = p?.status || 'Pending';
+            const progressVal = p?.progress || 0;
+            const totalTables = p?.total_tables || 0;
+            const completedTables = p?.completed_tables || 0;
+            const expanded = !!expandedDbs[dbKey];
+            const logs = dbLogs[dbKey] || [];
+
+            return (
+              <div key={dbKey} className={`schema-module schema-module-${status.toLowerCase()}`}>
+                <div className="schema-module-header" onClick={() => toggleDb(dbKey)}>
+                  <span className="schema-module-icon">{statusIcon(status)}</span>
+                  <span className="schema-module-name">{target.target_db.toUpperCase()}</span>
+                  <span className="schema-module-files">
+                    <span className="schema-file-tag">{target.tables_file}</span>
+                    <span className="schema-file-tag">{target.indexes_file}</span>
+                  </span>
+                  <span className="schema-module-status">{statusLabel(status)}</span>
+                  <span className="schema-module-toggle">{expanded ? '▼' : '▶'}</span>
+                </div>
+
+                <div className="schema-module-progress">
+                  <div className="progress-bar">
+                    <div
+                      className={`progress-fill ${status === 'Completed' ? 'progress-done' : ''}`}
+                      style={{ width: `${progressVal}%` }}
+                    />
+                  </div>
+                  {totalTables > 0 && (
+                    <span className="schema-db-tables">
+                      {completedTables}/{totalTables} 表 ({Math.round(progressVal)}%)
+                    </span>
+                  )}
+                </div>
+
+                {p?.error_message && (
+                  <div className="schema-db-error">{p.error_message}</div>
+                )}
+
+                {expanded && (
+                  <div className="schema-module-body">
+                    <div className="schema-log-header">
+                      <h3>SQL 执行日志</h3>
+                      {initializing && status === 'Running' && <span className="spinner-sm" />}
+                      <button
+                        className="btn-copy-log"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          copyDbLogs(dbKey);
+                        }}
+                        title="复制日志"
+                      >
+                        📋 复制
+                      </button>
+                      <button
+                        className="btn-copy-log"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          exportDbLogs(dbKey);
+                        }}
+                        title="导出日志"
+                      >
+                        💾 导出
+                      </button>
+                    </div>
+                    <div
+                      className="schema-log-content"
+                      ref={(el) => {
+                        logContainerRefs.current[dbKey] = el;
+                      }}
+                      onScroll={() => {
+                        const el = logContainerRefs.current[dbKey];
+                        if (!el) return;
+                        const isNearBottom =
+                          el.scrollHeight - el.scrollTop - el.clientHeight < 60;
+                        userScrolledUpRefs.current[dbKey] = !isNearBottom;
+                      }}
+                    >
+                      {logs.length === 0 ? (
+                        <div className="schema-log-empty">暂无日志</div>
+                      ) : (
+                        logs.map((line, i) => (
+                          <div key={i} className={`schema-log-line ${logLineClass(line)}`}>
+                            {line}
+                          </div>
+                        ))
+                      )}
+                      <div
+                        ref={(el) => {
+                          logEndRefs.current[dbKey] = el;
+                        }}
+                      />
+                    </div>
+                  </div>
+                )}
+              </div>
+            );
+          })}
         </div>
       )}
 
@@ -224,44 +463,12 @@ export default function SchemaInit({ dbConfigs, selectedDbConfigId}: Props) {
         >
           {initializing ? '⏳ 初始化中...' : '🔧 执行数据库初始化'}
         </button>
+        {globalLogs.length > 0 && (
+          <button className="btn btn-secondary" onClick={exportAllLogs} disabled={initializing}>
+            💾 导出全部日志
+          </button>
+        )}
       </div>
-
-      {logs.length > 0 && (
-        <div className="schema-log-viewer">
-          <div className="schema-log-header">
-            <h3>SQL 执行日志</h3>
-            {initializing && <span className="spinner-sm" />}
-            <button className="btn-copy-log" onClick={handleCopyLogs} title="复制日志">
-              📋 复制
-            </button>
-            <button className="btn-copy-log" onClick={handleExportLogs} title="导出日志">
-              💾 导出
-            </button>
-          </div>
-          <div
-            className="schema-log-content"
-            ref={logContainerRef}
-            onScroll={() => {
-              const el = logContainerRef.current;
-              if (!el) return;
-              const isNearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
-              userScrolledUpRef.current = !isNearBottom;
-            }}
-          >
-            {logs.map((line, i) => (
-              <div
-                key={i}
-                className={`schema-log-line ${line.startsWith('✗') ? 'log-error' : line.startsWith('✓') ? 'log-success' : line.startsWith('▶') ? 'log-header' : line.startsWith('═') ? 'log-footer' : line.startsWith('初始化完成') ? 'log-summary' : ''}`}
-              >
-                {line}
-              </div>
-            ))}
-            <div ref={logEndRef} />
-          </div>
-        </div>
-      )}
-
-
     </div>
   );
 }

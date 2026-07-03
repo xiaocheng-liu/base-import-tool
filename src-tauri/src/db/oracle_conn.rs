@@ -273,6 +273,64 @@ impl DbConnection for OracleConnection {
             .map_err(|e| format_db_error("Oracle 执行 SQL 失败", e))?;
         Ok(())
     }
+
+    async fn get_table_comment(&self, table: &TableIdentifier) -> Result<Option<String>, String> {
+        let owner = effective_schema(&table.schema, &self.schema);
+        let table_name = table.table_name.to_uppercase();
+        let mut result_set = self
+            .conn
+            .query_as::<String>(
+                "SELECT COMMENTS FROM ALL_TAB_COMMENTS WHERE OWNER = :1 AND TABLE_NAME = :2 AND COMMENTS IS NOT NULL",
+                &[&owner.as_str(), &table_name.as_str()],
+            )
+            .map_err(|e| format_db_error("Oracle 查询表注释失败", e))?;
+        if let Some(Ok(comment)) = result_set.next() {
+            if comment.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(comment))
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn get_column_comments(
+        &self,
+        table: &TableIdentifier,
+    ) -> Result<std::collections::HashMap<String, String>, String> {
+        let owner = effective_schema(&table.schema, &self.schema);
+        let table_name = table.table_name.to_uppercase();
+        let rows = self
+            .conn
+            .query_as::<(String, String)>(
+                "SELECT COLUMN_NAME, COMMENTS FROM ALL_COL_COMMENTS WHERE OWNER = :1 AND TABLE_NAME = :2 AND COMMENTS IS NOT NULL",
+                &[&owner.as_str(), &table_name.as_str()],
+            )
+            .map_err(|e| format_db_error("Oracle 查询字段注释失败", e))?;
+        let mut comments = std::collections::HashMap::new();
+        for row in rows {
+            let (name, comment) =
+                row.map_err(|e| format_db_error("Oracle 读取字段注释失败", e))?;
+            if !name.is_empty() && !comment.is_empty() {
+                comments.insert(name, comment);
+            }
+        }
+        Ok(comments)
+    }
+
+    async fn schema_exists(&self, schema: &str) -> Result<bool, String> {
+        let sql = "SELECT COUNT(*) FROM ALL_USERS WHERE USERNAME = :1";
+        let mut result_set = self
+            .conn
+            .query_as::<i32>(sql, &[&schema.to_uppercase().as_str()])
+            .map_err(|e| format_db_error("Oracle 查询用户存在性失败", e))?;
+        if let Some(Ok(count)) = result_set.next() {
+            Ok(count > 0)
+        } else {
+            Ok(false)
+        }
+    }
 }
 
 /// 返回有效 schema，DDL 中为空时使用连接用户。

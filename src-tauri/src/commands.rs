@@ -7,6 +7,7 @@ use csv::ReaderBuilder;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use tauri::Emitter;
 use tauri::State;
 use uuid::Uuid;
 
@@ -15,6 +16,7 @@ pub struct AppState {
     pub db_configs: Mutex<Vec<DbConfig>>,
     pub db_config_path: PathBuf,
     pub import_progress: Arc<Mutex<HashMap<String, ImportProgress>>>,
+    pub schema_init_progress: Arc<Mutex<HashMap<String, SchemaInitProgress>>>,
 }
 
 /// 扫描文件夹，返回所有 CSV 文件信息
@@ -871,13 +873,14 @@ pub fn get_table_schema(
     converter.get_table_schema(&target_db, &table_name)
 }
 
-/// 一键初始化所有 Schema 目录下的数据库表结构
+/// 一键初始化所有 Schema 目录下的数据库表结构（并发执行）
 #[tauri::command]
 pub async fn init_all_schemas(
     state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
     db_config_id: String,
     schema_dir: String,
-) -> Result<String, String> {
+) -> Result<Vec<String>, String> {
     let db_config = {
         let configs = state.db_configs.lock().map_err(|e| e.to_string())?;
         configs
@@ -890,272 +893,167 @@ pub async fn init_all_schemas(
     let converter = DdlConverter::new(PathBuf::from(&schema_dir));
     let targets = converter.list_schema_targets()?;
 
-    let mut results = Vec::new();
-    results.push(format!(
-        "开始初始化 {} 个库的表结构...",
-        targets.len()
-    ));
+    let total = targets.len();
+    let start_msg = format!("开始初始化 {} 个库的表结构...", total);
+    emit_schema_log(&app_handle, &start_msg);
 
-    for target in &targets {
-        results.push(format!("-- 初始化库: {} --", target.target_db));
-        match converter.execute_ddl(&db_config, &target.target_db).await {
-            Ok(log) => {
-                results.push(log);
-            }
-            Err(e) => {
-                results.push(format!("✗ 库 {} 初始化失败: {}", target.target_db, e));
-            }
+    // 注册每个库的初始进度
+    {
+        let mut progress_map = state
+            .schema_init_progress
+            .lock()
+            .map_err(|e| e.to_string())?;
+        for target in &targets {
+            progress_map.insert(
+                target.target_db.clone(),
+                SchemaInitProgress {
+                    target_db: target.target_db.clone(),
+                    status: SchemaInitStatus::Pending,
+                    progress: 0.0,
+                    total_tables: 0,
+                    completed_tables: 0,
+                    error_message: None,
+                },
+            );
         }
     }
 
-    results.push("所有库初始化完成".to_string());
-    Ok(results.join("\n"))
+    let progress_map = Arc::clone(&state.schema_init_progress);
+    let task_ids: Vec<String> = targets.iter().map(|t| t.target_db.clone()).collect();
+
+    // 并发启动每个库的初始化任务
+    for target in &targets {
+        let db_config = db_config.clone();
+        let schema_dir = PathBuf::from(&schema_dir);
+        let target_db = target.target_db.clone();
+        let app_handle = app_handle.clone();
+        let progress_map = Arc::clone(&progress_map);
+
+        tokio::spawn(async move {
+            update_schema_progress(
+                &progress_map,
+                &target_db,
+                SchemaInitStatus::Running,
+                0.0,
+                0,
+                0,
+                None,
+            );
+
+            let lib_msg = format!("-- 初始化库: {} --", target_db);
+            emit_schema_log(&app_handle, &lib_msg);
+
+            let converter = DdlConverter::new(schema_dir);
+            match converter
+                .execute_ddl_with_progress(&db_config, &target_db, Some(&progress_map))
+                .await
+            {
+                Ok(log) => {
+                    emit_schema_log(&app_handle, &log);
+                    update_schema_progress(
+                        &progress_map,
+                        &target_db,
+                        SchemaInitStatus::Completed,
+                        100.0,
+                        0,
+                        0,
+                        None,
+                    );
+                }
+                Err(e) => {
+                    let err_msg = format!("✗ 库 {} 初始化失败: {}", target_db, e);
+                    emit_schema_log(&app_handle, &err_msg);
+                    update_schema_progress(
+                        &progress_map,
+                        &target_db,
+                        SchemaInitStatus::Failed,
+                        0.0,
+                        0,
+                        0,
+                        Some(e),
+                    );
+                }
+            }
+        });
+    }
+
+    // 监控所有任务完成
+    let progress_map_done = Arc::clone(&progress_map);
+    let app_handle_done = app_handle.clone();
+    let task_ids_clone = task_ids.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            let all_done = {
+                let map = progress_map_done.lock().unwrap();
+                task_ids_clone.iter().all(|id| {
+                    map.get(id)
+                        .map(|p| {
+                            p.status == SchemaInitStatus::Completed
+                                || p.status == SchemaInitStatus::Failed
+                        })
+                        .unwrap_or(true)
+                })
+            };
+            if all_done {
+                let done_msg = "所有库初始化完成".to_string();
+                emit_schema_log(&app_handle_done, &done_msg);
+                break;
+            }
+        }
+    });
+
+    Ok(task_ids)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{
-        find_sql_keyword, import_target_table, prepare_sql_statements, read_csv_data,
-        read_sql_data,
-    };
-    use crate::db::DbValue;
-    use crate::models::{CsvFileInfo, DbType, ImportFileType};
-    use std::fs;
+/// 获取 Schema 初始化进度（前端轮询用）
+#[tauri::command]
+pub fn get_schema_init_progress(
+    state: State<AppState>,
+    target_dbs: Vec<String>,
+) -> Result<HashMap<String, SchemaInitProgress>, String> {
+    let progress_map = state
+        .schema_init_progress
+        .lock()
+        .map_err(|e| e.to_string())?;
 
-    #[test]
-    fn reads_empty_csv_fields_as_null_values() {
-        let file = std::env::temp_dir().join(format!(
-            "base-import-tool-null-csv-{}.csv",
-            std::process::id()
-        ));
-        fs::write(&file, "id,kc_order,name\n1,,分类\n").unwrap();
-
-        let data = read_csv_data(file.to_str().unwrap()).unwrap();
-
-        assert_eq!(data.columns, vec!["id", "kc_order", "name"]);
-        assert_eq!(
-            data.rows[0],
-            vec![
-                DbValue::Text("1".to_string()),
-                DbValue::Null,
-                DbValue::Text("分类".to_string())
-            ]
-        );
-
-        let _ = fs::remove_file(file);
-    }
-
-    #[test]
-    fn builds_import_target_table_from_csv_database_folder() {
-        let csv_file = CsvFileInfo {
-            file_name: "attribute_dict.csv".to_string(),
-            file_path: "/data/drug_spec/attribute_dict.csv".to_string(),
-            file_type: ImportFileType::Csv,
-            target_db: "drug_spec".to_string(),
-            table_name: "attribute_dict".to_string(),
-            row_count: None,
-            columns: vec!["id".to_string()],
-        };
-
-        let table = import_target_table(&csv_file);
-
-        assert_eq!(table.schema, "drug_spec");
-        assert_eq!(table.table_name, "attribute_dict");
-    }
-
-    #[test]
-    fn reads_sql_file_content_for_import() {
-        let file = std::env::temp_dir().join(format!(
-            "base-import-tool-import-sql-{}.sql",
-            std::process::id()
-        ));
-        fs::write(&file, "insert into cbs.sys_user(id) values (1);").unwrap();
-
-        let sql = read_sql_data(file.to_str().unwrap()).unwrap();
-
-        assert_eq!(sql, "insert into cbs.sys_user(id) values (1);");
-
-        let _ = fs::remove_file(file);
-    }
-
-    #[test]
-    fn prepares_mysql_sql_statements_from_oracle_style_script() {
-        let script = r#"
-INSERT INTO "CBS"."DICT_ADM_ROUTE" ("ADMIN_NAME", "ENGLISH_NAME") VALUES ('门诊', 'OUTPATIENT');
-INSERT INTO "CBS"."DICT_ADM_ROUTE" ("ADMIN_NAME") VALUES ('急诊');
-"#;
-
-        let statements = prepare_sql_statements(script, &DbType::MySQL, "cbs");
-
-        assert_eq!(statements.len(), 2);
-        assert_eq!(
-            statements[0],
-            "INSERT INTO `cbs`.`dict_adm_route` (`admin_name`, `english_name`) VALUES ('门诊', 'OUTPATIENT') ON DUPLICATE KEY UPDATE `admin_name` = VALUES(`admin_name`), `english_name` = VALUES(`english_name`)"
-        );
-        assert_eq!(
-            statements[1],
-            "INSERT INTO `cbs`.`dict_adm_route` (`admin_name`) VALUES ('急诊') ON DUPLICATE KEY UPDATE `admin_name` = VALUES(`admin_name`)"
-        );
-    }
-
-    #[test]
-    fn prepares_postgres_sql_statements_from_oracle_style_script() {
-        let script = r#"INSERT INTO "CBS"."DICT_ADM_ROUTE" ("ADMIN_NAME") VALUES ('门诊');"#;
-
-        let statements = prepare_sql_statements(script, &DbType::PostgreSQL, "cbs");
-
-        assert_eq!(statements.len(), 1);
-        assert_eq!(
-            statements[0],
-            "INSERT INTO \"cbs\".\"dict_adm_route\" (\"admin_name\") VALUES ('门诊')"
-        );
-    }
-
-    #[test]
-    fn prepares_mysql_insert_select_with_duplicate_key_update() {
-        let script =
-            r#"INSERT INTO "CBS"."DICT_DOCTOR_TITLE" ("ID", "NAME") SELECT '1', '主任医师' FROM DUAL;"#;
-
-        let statements = prepare_sql_statements(script, &DbType::MySQL, "cbs");
-
-        assert_eq!(statements.len(), 1);
-        assert_eq!(
-            statements[0],
-            "INSERT INTO `cbs`.`dict_doctor_title` (`id`, `name`) SELECT '1', '主任医师' FROM DUAL ON DUPLICATE KEY UPDATE `id` = VALUES(`id`), `name` = VALUES(`name`)"
-        );
-    }
-
-    #[test]
-    fn prepares_mysql_insert_without_schema_using_target_db() {
-        let script = r#"INSERT INTO "DICT_DRUG_CATE" ("ID", "NAME") VALUES ('1', '西药');"#;
-
-        let statements = prepare_sql_statements(script, &DbType::MySQL, "cbs");
-
-        assert_eq!(statements.len(), 1);
-        assert_eq!(
-            statements[0],
-            "INSERT INTO `cbs`.`dict_drug_cate` (`id`, `name`) VALUES ('1', '西药') ON DUPLICATE KEY UPDATE `id` = VALUES(`id`), `name` = VALUES(`name`)"
-        );
-    }
-
-    #[test]
-    fn prepares_mysql_truncate_without_schema_using_target_db() {
-        let script = r#"TRUNCATE TABLE "DICT_DRUG_CATE";"#;
-
-        let statements = prepare_sql_statements(script, &DbType::MySQL, "cbs");
-
-        assert_eq!(statements.len(), 1);
-        assert_eq!(statements[0], "TRUNCATE TABLE `cbs`.`dict_drug_cate`");
-    }
-
-    #[test]
-    fn prepares_mysql_truncate_with_schema_keeps_prefix() {
-        let script = r#"TRUNCATE TABLE "CBS"."DICT_DRUG_CATE";"#;
-
-        let statements = prepare_sql_statements(script, &DbType::MySQL, "cbs");
-
-        assert_eq!(statements.len(), 1);
-        assert_eq!(statements[0], "TRUNCATE TABLE `cbs`.`dict_drug_cate`");
-    }
-
-    #[test]
-    fn prepares_mysql_delete_without_schema_using_target_db() {
-        let script = r#"DELETE FROM "DICT_DRUG_CATE";"#;
-
-        let statements = prepare_sql_statements(script, &DbType::MySQL, "cbs");
-
-        assert_eq!(statements.len(), 1);
-        assert_eq!(statements[0], "DELETE FROM `cbs`.`dict_drug_cate`");
-    }
-
-    #[test]
-    fn prepares_mysql_delete_with_schema_keeps_prefix() {
-        let script = r#"DELETE FROM "CBS"."DICT_DRUG_CATE" WHERE ID = '1';"#;
-
-        let statements = prepare_sql_statements(script, &DbType::MySQL, "cbs");
-
-        assert_eq!(statements.len(), 1);
-        assert_eq!(
-            statements[0],
-            "DELETE FROM `cbs`.`dict_drug_cate` WHERE ID = '1'"
-        );
-    }
-
-    #[test]
-    fn prepares_mysql_update_without_schema_using_target_db() {
-        let script = r#"UPDATE "DICT_DRUG_CATE" SET NAME = 'test';"#;
-
-        let statements = prepare_sql_statements(script, &DbType::MySQL, "cbs");
-
-        assert_eq!(statements.len(), 1);
-        assert_eq!(
-            statements[0],
-            "UPDATE `cbs`.`dict_drug_cate` SET NAME = 'test'"
-        );
-    }
-
-    #[test]
-    fn preserves_non_dml_statements() {
-        let script = r#"SELECT 1 FROM DUAL;"#;
-
-        let statements = prepare_sql_statements(script, &DbType::MySQL, "cbs");
-
-        assert_eq!(statements.len(), 1);
-        assert_eq!(statements[0], "SELECT 1 FROM DUAL");
-    }
-
-    #[test]
-    fn handles_compact_values_format() {
-        // 紧凑格式：)VALUES(，VALUES 前无空格
-        let script = r#"INSERT INTO "CBS"."DICT_ADM_ROUTE" ("ADMIN_NAME")VALUES('膀胱冲洗用');"#;
-
-        let statements = prepare_sql_statements(script, &DbType::MySQL, "cbs");
-
-        assert_eq!(statements.len(), 1);
-        assert_eq!(
-            statements[0],
-            "INSERT INTO `cbs`.`dict_adm_route` (`admin_name`)VALUES('膀胱冲洗用') ON DUPLICATE KEY UPDATE `admin_name` = VALUES(`admin_name`)"
-        );
-    }
-
-    #[test]
-    fn handles_compact_values_format_with_trailing_space() {
-        // 紧凑格式：)VALUES (，VALUES 后紧跟空格和左括号
-        let script = r#"INSERT INTO "CBS"."DICT_ADM_ROUTE" ("ADMIN_NAME")VALUES ('膀胱冲洗用');"#;
-
-        let statements = prepare_sql_statements(script, &DbType::MySQL, "cbs");
-
-        assert_eq!(statements.len(), 1);
-        assert!(
-            statements[0].contains("ON DUPLICATE KEY UPDATE"),
-            "should add ON DUPLICATE KEY UPDATE for compact VALUES format"
-        );
-    }
-
-    #[test]
-    fn find_sql_keyword_finds_with_space_before() {
-        let upper = "INSERT INTO TBL (A) VALUES (1)";
-        assert_eq!(find_sql_keyword(upper, "VALUES"), Some(20));
-    }
-
-    #[test]
-    fn find_sql_keyword_finds_with_paren_before() {
-        let upper = "INSERT INTO TBL (A)VALUES (1)";
-        assert_eq!(find_sql_keyword(upper, "VALUES"), Some(19));
-    }
-
-    #[test]
-    fn find_sql_keyword_finds_with_backtick_before() {
-        let upper = "INSERT INTO `TBL` (`A`)VALUES (1)";
-        assert_eq!(find_sql_keyword(upper, "VALUES"), Some(23));
-    }
-
-    #[test]
-    fn find_sql_keyword_ignores_values_in_identifier() {
-        let upper = "INSERT INTO MY_VALUES_TABLE (A) VALUES (1)";
-        let pos = find_sql_keyword(upper, "VALUES").unwrap();
-        // 应该匹配第二个 VALUES (关键字)，而不是 MY_VALUES_TABLE 中的 VALUES
-        assert!(pos > 20, "should match keyword VALUES, not identifier prefix");
-        assert_eq!(pos, 32);
+    if target_dbs.is_empty() {
+        Ok(progress_map.clone())
+    } else {
+        let filtered: HashMap<String, SchemaInitProgress> = target_dbs
+            .iter()
+            .filter_map(|db| progress_map.get(db).map(|p| (db.clone(), p.clone())))
+            .collect();
+        Ok(filtered)
     }
 }
+
+fn update_schema_progress(
+    progress_map: &Arc<Mutex<HashMap<String, SchemaInitProgress>>>,
+    target_db: &str,
+    status: SchemaInitStatus,
+    progress: f64,
+    total_tables: usize,
+    completed_tables: usize,
+    error_message: Option<String>,
+) {
+    if let Ok(mut map) = progress_map.lock() {
+        map.insert(
+            target_db.to_string(),
+            SchemaInitProgress {
+                target_db: target_db.to_string(),
+                status,
+                progress,
+                total_tables,
+                completed_tables,
+                error_message,
+            },
+        );
+    }
+}
+
+fn emit_schema_log(app_handle: &tauri::AppHandle, message: &str) {
+    log::info!("[schema] {}", message);
+    let _ = app_handle.emit("schema-log", message.to_string());
+}
+

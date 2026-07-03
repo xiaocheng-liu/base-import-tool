@@ -48,6 +48,11 @@ pub trait DbConnection: Send + Sync {
     /// 执行原始 SQL（用于 DDL 操作）
     async fn execute_raw_sql(&self, sql: &str) -> Result<(), String>;
 
+    /// 检查 schema（达梦/Oracle 中对应用户）是否存在，默认返回 true
+    async fn schema_exists(&self, _schema: &str) -> Result<bool, String> {
+        Ok(true)
+    }
+
     /// 获取表注释，默认返回 None
     async fn get_table_comment(&self, _table: &TableIdentifier) -> Result<Option<String>, String> {
         Ok(None)

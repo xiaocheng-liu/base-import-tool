@@ -12,6 +12,7 @@ export type TargetDb =
   | 'outpt'
   | 'procure';
 export type ImportStatus = 'Pending' | 'Running' | 'Completed' | 'Failed' | 'Skipped';
+export type SchemaInitStatus = 'Pending' | 'Running' | 'Completed' | 'Failed';
 
 export interface CsvFileInfo {
   file_name: string;
@@ -81,6 +82,15 @@ export interface SchemaTarget {
   target_db: string;
   tables_file: string;
   indexes_file: string;
+}
+
+export interface SchemaInitProgress {
+  target_db: string;
+  status: SchemaInitStatus;
+  progress: number;
+  total_tables: number;
+  completed_tables: number;
+  error_message: string | null;
 }
 
 export interface ColumnWithComment {

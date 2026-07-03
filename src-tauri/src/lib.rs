@@ -96,6 +96,7 @@ pub fn run() {
                 db_configs: Mutex::new(db_configs),
                 db_config_path,
                 import_progress: Arc::new(Mutex::new(HashMap::new())),
+                schema_init_progress: Arc::new(Mutex::new(HashMap::new())),
             });
 
             Ok(())
@@ -112,6 +113,7 @@ pub fn run() {
             commands::list_schema_targets,
             commands::init_schema,
             commands::init_all_schemas,
+            commands::get_schema_init_progress,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

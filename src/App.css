@@ -905,6 +905,140 @@ body {
   margin-top: 12px;
 }
 
+/* 每个库独立模块 */
+.schema-module-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.schema-module {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+  transition: border-color 0.2s, background 0.2s;
+}
+
+.schema-module-completed {
+  border-color: #a3e635;
+  background: #f7fee7;
+}
+
+.schema-module-failed {
+  border-color: #fca5a5;
+  background: #fef2f2;
+}
+
+.schema-module-running {
+  border-color: #93c5fd;
+  background: #eff6ff;
+}
+
+.schema-module-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.schema-module-header:hover {
+  background: rgba(0, 0, 0, 0.02);
+}
+
+.schema-module-icon {
+  font-size: 14px;
+  width: 18px;
+  text-align: center;
+}
+
+.schema-module-name {
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--text);
+  min-width: 80px;
+}
+
+.schema-module-files {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+.schema-module-files .schema-file-tag {
+  padding: 1px 6px;
+  background: #eef2ff;
+  color: var(--primary);
+  border-radius: 4px;
+  font-family: 'SF Mono', Monaco, monospace;
+  font-size: 10px;
+}
+
+.schema-module-status {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--text-secondary);
+  font-weight: 500;
+}
+
+.schema-module-toggle {
+  font-size: 11px;
+  color: var(--text-secondary);
+  width: 16px;
+  text-align: center;
+}
+
+.schema-module-progress {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 12px 8px;
+}
+
+.schema-module-progress .progress-bar {
+  flex: 1;
+  height: 6px;
+  background: #e2e8f0;
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.schema-module-progress .progress-fill {
+  height: 100%;
+  background: var(--primary);
+  border-radius: 3px;
+  transition: width 0.3s ease;
+}
+
+.schema-module-progress .progress-fill.progress-done {
+  background: var(--success);
+}
+
+.schema-module-body {
+  border-top: 1px solid var(--border);
+  background: #1e1e2e;
+}
+
+.schema-module-body .schema-log-header {
+  padding: 6px 12px;
+}
+
+.schema-module-body .schema-log-content {
+  max-height: 260px;
+  padding: 8px 12px;
+}
+
+.schema-module-body .schema-log-empty {
+  color: #6c7086;
+  font-size: 12px;
+  padding: 12px 0;
+  text-align: center;
+}
+
 .schema-file-summary {
   display: flex;
   flex-direction: column;
@@ -936,6 +1070,131 @@ body {
   border-radius: 4px;
   font-family: 'SF Mono', Monaco, monospace;
   font-size: 11px;
+}
+
+.schema-progress {
+  margin-top: 12px;
+  padding: 8px 12px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.schema-progress-info {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 12px;
+  color: var(--text-secondary);
+  margin-bottom: 6px;
+}
+
+.schema-progress .progress-bar {
+  height: 8px;
+  background: #e2e8f0;
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.schema-progress .progress-fill {
+  height: 100%;
+  background: var(--primary);
+  border-radius: 4px;
+  transition: width 0.3s ease;
+}
+
+.schema-progress .progress-fill.progress-done {
+  background: var(--success);
+}
+
+/* 每个库独立的进度条 */
+.schema-progress-list {
+  margin-top: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.schema-db-progress {
+  padding: 8px 12px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.schema-db-progress.schema-db-completed {
+  border-color: #a3e635;
+  background: #f7fee7;
+}
+
+.schema-db-progress.schema-db-failed {
+  border-color: #fca5a5;
+  background: #fef2f2;
+}
+
+.schema-db-progress.schema-db-running {
+  border-color: #93c5fd;
+  background: #eff6ff;
+}
+
+.schema-db-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.schema-db-icon {
+  font-size: 14px;
+}
+
+.schema-db-name {
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--text);
+}
+
+.schema-db-status {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.schema-db-bar-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.schema-db-bar-row .progress-bar {
+  flex: 1;
+  height: 6px;
+  background: #e2e8f0;
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.schema-db-bar-row .progress-fill {
+  height: 100%;
+  background: var(--primary);
+  border-radius: 3px;
+  transition: width 0.3s ease;
+}
+
+.schema-db-bar-row .progress-fill.progress-done {
+  background: var(--success);
+}
+
+.schema-db-tables {
+  font-size: 11px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.schema-db-error {
+  margin-top: 4px;
+  font-size: 11px;
+  color: #dc2626;
 }
 
 .schema-log-viewer {

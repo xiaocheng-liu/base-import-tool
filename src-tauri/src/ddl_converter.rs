@@ -1,6 +1,10 @@
-use crate::models::{ColumnInfo, DbConfig, DbType, IndexInfo, SchemaTarget, TableIdentifier};
+use crate::models::{
+    ColumnInfo, DbConfig, DbType, IndexInfo, SchemaInitProgress, SchemaInitStatus, SchemaTarget,
+    TableIdentifier,
+};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 /// Oracle DDL 到目标数据库 DDL 的转换器
 pub struct DdlConverter {
@@ -712,7 +716,8 @@ impl DdlConverter {
                     )
                 }
             }
-            _ => format!("\"{}\"", table.table_name.to_uppercase()),
+            // 达梦/Oracle：带 schema 前缀，表建在指定用户下而非连接用户下
+            _ => Self::format_table_name(&table.schema, &table.table_name, db_type),
         };
 
         let mut col_defs: Vec<String> = Vec::new();
@@ -1116,14 +1121,32 @@ impl DdlConverter {
         db_config: &DbConfig,
         target_db: &str,
     ) -> Result<String, String> {
-        let (tables_sql, indexes_sql) = self.read_schema_files(target_db)?;
-        let tables = self.parse_tables(&tables_sql)?;
-        let indexes = self.parse_indexes(&indexes_sql);
+        self.execute_ddl_with_progress(db_config, target_db, None)
+            .await
+    }
 
+    /// 执行 DDL 并上报进度（并发使用）
+    pub async fn execute_ddl_with_progress(
+        &self,
+        db_config: &DbConfig,
+        target_db: &str,
+        progress_map: Option<&Arc<Mutex<HashMap<String, SchemaInitProgress>>>>,
+    ) -> Result<String, String> {
+        log::info!("execute_ddl: 开始读取 {} 的表结构和索引文件", target_db);
+        let (tables_sql, indexes_sql) = self.read_schema_files(target_db)?;
+        log::info!("execute_ddl: 解析表定义...");
+        let tables = self.parse_tables(&tables_sql)?;
+        log::info!("execute_ddl: 共解析 {} 张表", tables.len());
+        let indexes = self.parse_indexes(&indexes_sql);
+        log::info!("execute_ddl: 共解析 {} 个索引", indexes.len());
+
+        log::info!("execute_ddl: 创建数据库连接...");
         let conn = crate::db::create_connection(db_config).await?;
 
         // 先测试连接
+        log::info!("execute_ddl: 测试数据库连接...");
         conn.test_connection().await?;
+        log::info!("execute_ddl: 连接测试通过");
 
         let mut results = Vec::new();
         let mut total_created_tables = 0;
@@ -1152,16 +1175,86 @@ impl DdlConverter {
             }
         }
 
+        // 达梦/Oracle：确保目标 schema（用户）存在，不存在则创建
+        if matches!(db_config.db_type, DbType::DM) || matches!(db_config.db_type, DbType::Oracle)
+        {
+            let mut schemas: Vec<String> = tables
+                .iter()
+                .map(|table| table.schema.to_uppercase())
+                .filter(|schema| !schema.is_empty())
+                .collect();
+            schemas.sort();
+            schemas.dedup();
+
+            for schema in &schemas {
+                if conn.schema_exists(schema).await? {
+                    results.push(format!("  用户 {} 已存在，跳过创建", schema));
+                    continue;
+                }
+                let create_user_sql = format!(
+                    "CREATE USER \"{}\" IDENTIFIED BY \"{}\"",
+                    schema, db_config.password
+                );
+                results.push(format!("  SQL: {}", create_user_sql));
+                if let Err(e) = conn.execute_raw_sql(&create_user_sql).await {
+                    return Err(format!("创建用户 {} 失败: {}", schema, e));
+                }
+                results.push(format!("  ✓ 用户 {} 创建成功", schema));
+
+                // 授予基本权限（DM 没有 CONNECT 角色，用 RESOURCE 即可满足建表+连接需求）
+                let grant_sql = if matches!(db_config.db_type, DbType::DM) {
+                    format!("GRANT RESOURCE TO \"{}\"", schema)
+                } else {
+                    format!("GRANT CONNECT, RESOURCE TO \"{}\"", schema)
+                };
+                results.push(format!("  SQL: {}", grant_sql));
+                if let Err(e) = conn.execute_raw_sql(&grant_sql).await {
+                    return Err(format!("为用户 {} 授权失败: {}", schema, e));
+                }
+                results.push(format!("  ✓ 用户 {} 授权成功", schema));
+            }
+        }
+
         // 执行建表或字段增量升级
-        for table in &tables {
+        log::info!("execute_ddl: 开始处理表结构，共 {} 张表", tables.len());
+
+        // 上报初始进度
+        if let Some(pm) = progress_map {
+            if let Ok(mut map) = pm.lock() {
+                map.insert(
+                    target_db.to_string(),
+                    SchemaInitProgress {
+                        target_db: target_db.to_string(),
+                        status: SchemaInitStatus::Running,
+                        progress: 0.0,
+                        total_tables: tables.len(),
+                        completed_tables: 0,
+                        error_message: None,
+                    },
+                );
+            }
+        }
+
+        for (table_idx, table) in tables.iter().enumerate() {
             let table_id = TableIdentifier {
                 schema: table.schema.clone(),
                 table_name: table.table_name.clone(),
             };
 
+            log::info!("execute_ddl: 检查表 {}.{} 是否存在", table.schema, table.table_name);
             let table_is_new = !conn.schema_table_exists(&table_id).await?;
+            log::info!(
+                "execute_ddl: 表 {}.{} 是否为新表: {}",
+                table.schema,
+                table.table_name,
+                table_is_new
+            );
             if table_is_new {
                 let ddl = Self::generate_create_table(table, &db_config.db_type);
+                log::info!(
+                    "execute_ddl: 准备创建表 {}.{}",
+                    table.schema, table.table_name
+                );
                 results.push(format!(
                     "  ▶ 创建表 {}.{}",
                     table.schema, table.table_name
@@ -1216,6 +1309,14 @@ impl DdlConverter {
                                     total_added_columns += 1;
                                     results.push(format!(
                                         "    ✓ 新增字段 {} 成功",
+                                        column.name
+                                    ));
+                                }
+                                Err(e)
+                                    if is_column_already_exists_error(&e) =>
+                                {
+                                    results.push(format!(
+                                        "    ⚠ 字段 {} 已存在，跳过",
                                         column.name
                                     ));
                                 }
@@ -1343,9 +1444,47 @@ impl DdlConverter {
                     ));
                 }
             }
+
+            // 上报当前表的进度
+            if let Some(pm) = progress_map {
+                if let Ok(mut map) = pm.lock() {
+                    let total = tables.len();
+                    let completed = table_idx + 1;
+                    map.insert(
+                        target_db.to_string(),
+                        SchemaInitProgress {
+                            target_db: target_db.to_string(),
+                            status: SchemaInitStatus::Running,
+                            progress: (completed as f64 / total as f64) * 90.0,
+                            total_tables: total,
+                            completed_tables: completed,
+                            error_message: None,
+                        },
+                    );
+                }
+            }
+        }
+
+        // 上报表处理完成的进度
+        if let Some(pm) = progress_map {
+            if let Ok(mut map) = pm.lock() {
+                let total = tables.len();
+                map.insert(
+                    target_db.to_string(),
+                    SchemaInitProgress {
+                        target_db: target_db.to_string(),
+                        status: SchemaInitStatus::Running,
+                        progress: 95.0,
+                        total_tables: total,
+                        completed_tables: total,
+                        error_message: None,
+                    },
+                );
+            }
         }
 
         // 按表分组处理索引（新增/修改/删除）
+        log::info!("execute_ddl: 开始处理索引...");
         let tables_in_schema: Vec<&TableDef> = tables.iter().collect();
         let mut table_indexes: HashMap<(&str, &str), Vec<&IndexDef>> = HashMap::new();
         for index in &indexes {
@@ -1506,6 +1645,7 @@ impl DdlConverter {
             }
         }
 
+        log::info!("execute_ddl: {} 处理完成", target_db);
         results.push(format!(
             "初始化完成：创建 {} 张表，新增 {} 个字段，扩容 {} 个字段，新增/修改 {} 个索引",
             total_created_tables, total_added_columns, total_modified_columns, total_indexes
@@ -1681,7 +1821,7 @@ fn format_existing_column_type(existing: &ColumnInfo) -> String {
         } else if upper.starts_with("TEXT") || upper.starts_with("BLOB") {
             // TEXT/BLOB 不需要显示长度，直接返回
             upper.to_string()
-        } else if upper.starts_with("DECIMAL") || upper.starts_with("NUMERIC") {
+        } else if upper.starts_with("DECIMAL") || upper.starts_with("NUMERIC") || upper.starts_with("NUMBER") {
             if let Some(p) = existing.data_precision {
                 if let Some(s) = existing.data_scale {
                     format!("{}({}, {})", upper, p, s)
@@ -1872,4 +2012,14 @@ fn same_columns(left: &[String], right: &[String]) -> bool {
             .iter()
             .zip(right)
             .all(|(l, r)| l.eq_ignore_ascii_case(r))
+}
+
+/// 判断 ADD COLUMN 失败是否因为字段已存在（达梦、Oracle、MySQL、PostgreSQL）
+fn is_column_already_exists_error(error: &str) -> bool {
+    let lower = error.to_lowercase();
+    lower.contains("已存在")
+        || lower.contains("already exists")
+        || lower.contains("duplicate column")
+        || lower.contains("duplicate")
+        && lower.contains("column")
 }

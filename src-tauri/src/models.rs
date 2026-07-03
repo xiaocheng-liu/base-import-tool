@@ -223,6 +223,26 @@ pub struct ImportProgress {
     pub error_message: Option<String>,
 }
 
+/// Schema 初始化状态
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum SchemaInitStatus {
+    Pending,
+    Running,
+    Completed,
+    Failed,
+}
+
+/// Schema 初始化进度（每个库独立追踪）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchemaInitProgress {
+    pub target_db: String,
+    pub status: SchemaInitStatus,
+    pub progress: f64,
+    pub total_tables: usize,
+    pub completed_tables: usize,
+    pub error_message: Option<String>,
+}
+
 /// 测试连接结果
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectionTestResult {
