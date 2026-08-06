@@ -93,6 +93,48 @@ export interface SchemaInitProgress {
   error_message: string | null;
 }
 
+export type SchemaChangeKind =
+  | 'CreateTable'
+  | 'AddColumn'
+  | 'ExpandColumn'
+  | 'UpdateTableComment'
+  | 'UpdateColumnComment';
+
+export interface SchemaChange {
+  kind: SchemaChangeKind;
+  object_name: string;
+  current: string | null;
+  target: string | null;
+  executable: boolean;
+}
+
+export interface TableDiff {
+  schema: string;
+  table_name: string;
+  is_new_table: boolean;
+  new_table_columns: string[];
+  changes: SchemaChange[];
+  executable_change_count: number;
+}
+
+export interface SchemaDbDiff {
+  target_db: string;
+  tables: TableDiff[];
+  warnings: string[];
+  error: string | null;
+  executable_change_count: number;
+}
+
+export interface SchemaDiffReport {
+  databases: SchemaDbDiff[];
+  database_count: number;
+  new_table_count: number;
+  field_change_count: number;
+  comment_change_count: number;
+  executable_change_count: number;
+  has_errors: boolean;
+}
+
 export interface ColumnWithComment {
   name: string;
   data_type: string;

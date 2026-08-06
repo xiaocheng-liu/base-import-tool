@@ -46,6 +46,7 @@ function App() {
             setDbConfigs={setDbConfigs}
             selectedDbConfigId={selectedDbConfigId}
             setSelectedDbConfigId={setSelectedDbConfigId}
+            onSaved={() => setActiveTab('schema')}
           />
         </div>
         <div style={{ display: activeTab === 'schema' ? 'block' : 'none' }}>

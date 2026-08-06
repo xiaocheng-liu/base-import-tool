@@ -1,5 +1,6 @@
 use crate::models::{
-    ColumnInfo, DbConfig, DbType, IndexInfo, SchemaInitProgress, SchemaInitStatus, SchemaTarget,
+    ColumnInfo, DbConfig, DbType, IndexInfo, SchemaChange, SchemaChangeKind, SchemaDbDiff,
+    SchemaDiffReport, SchemaInitProgress, SchemaInitStatus, SchemaTarget, TableDiff,
     TableIdentifier,
 };
 use std::collections::HashMap;
@@ -40,6 +41,155 @@ pub struct IndexDef {
     pub columns: Vec<String>,
 }
 
+/// 单表当前数据库结构，用于生成只读差异规划。
+#[derive(Debug, Clone, Default)]
+pub struct ExistingTableSchema {
+    pub columns: Vec<ColumnInfo>,
+    pub table_comment: Option<String>,
+    pub column_comments: HashMap<String, String>,
+}
+
+/// 比较注释内容，忽略仅影响排版的空白差异。
+pub fn comments_equal(left: &str, right: &str) -> bool {
+    left.split_whitespace().eq(right.split_whitespace())
+}
+
+/// 对比脚本表定义与当前数据库结构。
+pub fn build_table_diff(
+    table: &TableDef,
+    existing: Option<&ExistingTableSchema>,
+    db_type: &DbType,
+) -> TableDiff {
+    let mut changes = Vec::new();
+    let is_new_table = existing.is_none();
+
+    if is_new_table {
+        changes.push(SchemaChange {
+            kind: SchemaChangeKind::CreateTable,
+            object_name: format!("{}.{}", table.schema, table.table_name),
+            current: None,
+            target: Some(format!("{} 个字段", table.columns.len())),
+            executable: true,
+        });
+    } else if let Some(existing) = existing {
+        for column in &table.columns {
+            if !existing
+                .columns
+                .iter()
+                .any(|item| item.name.eq_ignore_ascii_case(&column.name))
+            {
+                changes.push(SchemaChange {
+                    kind: SchemaChangeKind::AddColumn,
+                    object_name: column.name.clone(),
+                    current: None,
+                    target: Some(DdlConverter::map_oracle_type(&column.data_type, db_type)),
+                    executable: true,
+                });
+            }
+        }
+        for column in &table.columns {
+            if let Some(current) = existing
+                .columns
+                .iter()
+                .find(|item| item.name.eq_ignore_ascii_case(&column.name))
+            {
+                if should_expand_column(current, column) {
+                    changes.push(SchemaChange {
+                        kind: SchemaChangeKind::ExpandColumn,
+                        object_name: column.name.clone(),
+                        current: Some(format_existing_column_type(current)),
+                        target: Some(DdlConverter::map_oracle_type(&column.data_type, db_type)),
+                        executable: true,
+                    });
+                }
+            }
+        }
+
+        if let Some(expected_comment) = table.comment.as_ref().filter(|value| !value.is_empty()) {
+            if !existing
+                .table_comment
+                .as_deref()
+                .is_some_and(|current| comments_equal(current, expected_comment))
+            {
+                changes.push(SchemaChange {
+                    kind: SchemaChangeKind::UpdateTableComment,
+                    object_name: table.table_name.clone(),
+                    current: existing.table_comment.clone(),
+                    target: Some(expected_comment.clone()),
+                    executable: true,
+                });
+            }
+        }
+        for (column_name, expected_comment) in &table.column_comments {
+            if expected_comment.is_empty() {
+                continue;
+            }
+            let current = existing
+                .column_comments
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(column_name))
+                .map(|(_, value)| value.clone());
+            if !current
+                .as_deref()
+                .is_some_and(|value| comments_equal(value, expected_comment))
+            {
+                changes.push(SchemaChange {
+                    kind: SchemaChangeKind::UpdateColumnComment,
+                    object_name: column_name.clone(),
+                    current,
+                    target: Some(expected_comment.clone()),
+                    executable: true,
+                });
+            }
+        }
+
+    }
+
+    let executable_change_count = changes.iter().filter(|item| item.executable).count();
+    TableDiff {
+        schema: table.schema.clone(),
+        table_name: table.table_name.clone(),
+        is_new_table,
+        new_table_columns: if is_new_table {
+            table
+                .columns
+                .iter()
+                .map(|column| column.name.clone())
+                .collect()
+        } else {
+            Vec::new()
+        },
+        changes,
+        executable_change_count,
+    }
+}
+
+/// 汇总各库结构差异。
+pub fn build_schema_diff_report(databases: Vec<SchemaDbDiff>) -> SchemaDiffReport {
+    let mut report = SchemaDiffReport {
+        database_count: databases.len(),
+        has_errors: databases.iter().any(|database| database.error.is_some()),
+        ..SchemaDiffReport::default()
+    };
+    for database in &databases {
+        report.executable_change_count += database.executable_change_count;
+        for table in &database.tables {
+            for change in &table.changes {
+                match change.kind {
+                    SchemaChangeKind::CreateTable => report.new_table_count += 1,
+                    SchemaChangeKind::AddColumn | SchemaChangeKind::ExpandColumn => {
+                        report.field_change_count += 1;
+                    }
+                    SchemaChangeKind::UpdateTableComment
+                    | SchemaChangeKind::UpdateColumnComment => report.comment_change_count += 1,
+                }
+            }
+        }
+    }
+    report.databases = databases;
+    report
+}
+
 impl IndexDef {
     pub fn is_plain_column_index(&self) -> bool {
         self.columns
@@ -51,6 +201,72 @@ impl IndexDef {
 impl DdlConverter {
     pub fn new(schema_dir: PathBuf) -> Self {
         DdlConverter { schema_dir }
+    }
+
+    /// 扫描单个业务库的结构差异。
+    pub async fn scan_schema_diff(
+        &self,
+        db_config: &DbConfig,
+        target_db: &str,
+    ) -> Result<SchemaDbDiff, String> {
+        let (tables_sql, _) = self.read_schema_files(target_db)?;
+        let tables = self.parse_tables(&tables_sql)?;
+        let connection = crate::db::create_connection(db_config).await?;
+        connection.test_connection().await?;
+
+        let mut table_diffs = Vec::new();
+        let mut warnings = Vec::new();
+        for table in &tables {
+            let table_id = TableIdentifier {
+                schema: table.schema.clone(),
+                table_name: table.table_name.clone(),
+            };
+            let existing = if connection.schema_table_exists(&table_id).await? {
+                let table_comment = match connection.get_table_comment(&table_id).await {
+                    Ok(value) => value,
+                    Err(error) => {
+                        warnings.push(format!(
+                            "读取 {}.{} 表注释失败: {}",
+                            table.schema, table.table_name, error
+                        ));
+                        None
+                    }
+                };
+                let column_comments = match connection.get_column_comments(&table_id).await {
+                    Ok(value) => value,
+                    Err(error) => {
+                        warnings.push(format!(
+                            "读取 {}.{} 字段注释失败: {}",
+                            table.schema, table.table_name, error
+                        ));
+                        HashMap::new()
+                    }
+                };
+                Some(ExistingTableSchema {
+                    columns: connection.get_columns(&table_id).await?,
+                    table_comment,
+                    column_comments,
+                })
+            } else {
+                None
+            };
+            let diff = build_table_diff(table, existing.as_ref(), &db_config.db_type);
+            if !diff.changes.is_empty() {
+                table_diffs.push(diff);
+            }
+        }
+
+        let executable_change_count = table_diffs
+            .iter()
+            .map(|table| table.executable_change_count)
+            .sum();
+        Ok(SchemaDbDiff {
+            target_db: target_db.to_string(),
+            tables: table_diffs,
+            warnings,
+            error: None,
+            executable_change_count,
+        })
     }
 
     /// 读取指定 target_db 的 tables 和 indexes SQL 文件
@@ -787,24 +1003,18 @@ impl DdlConverter {
         let table_name = Self::format_table_name(&table.schema, &table.table_name, db_type);
         let escaped_comment = comment.replace('\'', "''");
         match db_type {
-            DbType::MySQL => {
-                Some(format!(
-                    "ALTER TABLE {} COMMENT '{}';",
-                    table_name, escaped_comment
-                ))
-            }
-            DbType::DM | DbType::Oracle => {
-                Some(format!(
-                    "COMMENT ON TABLE {} IS '{}';",
-                    table_name, escaped_comment
-                ))
-            }
-            DbType::PostgreSQL => {
-                Some(format!(
-                    "COMMENT ON TABLE {} IS '{}';",
-                    table_name, escaped_comment
-                ))
-            }
+            DbType::MySQL => Some(format!(
+                "ALTER TABLE {} COMMENT '{}';",
+                table_name, escaped_comment
+            )),
+            DbType::DM | DbType::Oracle => Some(format!(
+                "COMMENT ON TABLE {} IS '{}';",
+                table_name, escaped_comment
+            )),
+            DbType::PostgreSQL => Some(format!(
+                "COMMENT ON TABLE {} IS '{}';",
+                table_name, escaped_comment
+            )),
         }
     }
 
@@ -824,11 +1034,16 @@ impl DdlConverter {
                 continue;
             }
             // 查找该列在 table.columns 中是否存在，并获取其类型信息
-            let col_def = table.columns.iter().find(|c| c.name.eq_ignore_ascii_case(col_name));
+            let col_def = table
+                .columns
+                .iter()
+                .find(|c| c.name.eq_ignore_ascii_case(col_name));
             let Some(col_def) = col_def else {
                 log::warn!(
                     "generate_column_comment_ddl: column {} not found in table {}.{}",
-                    col_name, table.schema, table.table_name
+                    col_name,
+                    table.schema,
+                    table.table_name
                 );
                 continue;
             };
@@ -841,12 +1056,23 @@ impl DdlConverter {
                     let formatted_col = format!("`{}`", col_name.to_lowercase());
                     let col_type = Self::map_oracle_type(&col_def.data_type, db_type);
                     // 主键列在 MySQL 中必须是 NOT NULL
-                    let is_pk = table.primary_key.iter().any(|pk| pk.eq_ignore_ascii_case(col_name));
-                    let nullable = if is_pk || !col_def.nullable { "NOT NULL" } else { "NULL" };
-                    let default = Self::format_default_value(&col_type, &col_def.default_value, db_type);
+                    let is_pk = table
+                        .primary_key
+                        .iter()
+                        .any(|pk| pk.eq_ignore_ascii_case(col_name));
+                    let nullable = if is_pk || !col_def.nullable {
+                        "NOT NULL"
+                    } else {
+                        "NULL"
+                    };
+                    let default =
+                        Self::format_default_value(&col_type, &col_def.default_value, db_type);
                     stmts.push(format!(
                         "ALTER TABLE {} MODIFY COLUMN {} {} {} {} COMMENT '{}';",
-                        table_name, formatted_col, col_type, nullable,
+                        table_name,
+                        formatted_col,
+                        col_type,
+                        nullable,
                         if default.is_empty() { "" } else { &default },
                         escaped_comment
                     ));
@@ -891,12 +1117,23 @@ impl DdlConverter {
             DbType::MySQL => {
                 let formatted_col = format!("`{}`", col_name.to_lowercase());
                 let col_type = Self::map_oracle_type(&col_def.data_type, db_type);
-                let is_pk = table.primary_key.iter().any(|pk| pk.eq_ignore_ascii_case(col_name));
-                let nullable = if is_pk || !col_def.nullable { "NOT NULL" } else { "NULL" };
-                let default = Self::format_default_value(&col_type, &col_def.default_value, db_type);
+                let is_pk = table
+                    .primary_key
+                    .iter()
+                    .any(|pk| pk.eq_ignore_ascii_case(col_name));
+                let nullable = if is_pk || !col_def.nullable {
+                    "NOT NULL"
+                } else {
+                    "NULL"
+                };
+                let default =
+                    Self::format_default_value(&col_type, &col_def.default_value, db_type);
                 format!(
                     "ALTER TABLE {} MODIFY COLUMN {} {} {} {} COMMENT '{}';",
-                    table_name, formatted_col, col_type, nullable,
+                    table_name,
+                    formatted_col,
+                    col_type,
+                    nullable,
                     if default.is_empty() { "" } else { &default },
                     escaped_comment
                 )
@@ -951,9 +1188,8 @@ impl DdlConverter {
             Vec::new()
         };
 
-        let needs_prefix_for_size =
-            matches!(db_type, DbType::MySQL)
-                && mysql_index_columns.iter().map(|(_, len)| len).sum::<u32>() > 3072;
+        let needs_prefix_for_size = matches!(db_type, DbType::MySQL)
+            && mysql_index_columns.iter().map(|(_, len)| len).sum::<u32>() > 3072;
 
         let cols: Vec<String> = index
             .columns
@@ -1115,7 +1351,7 @@ impl DdlConverter {
         }
     }
 
-    /// 执行 DDL 增量升级（CREATE TABLE + ADD/MODIFY COLUMN + CREATE INDEX）
+    /// 执行 DDL 增量升级（CREATE TABLE + ADD/MODIFY COLUMN）。
     pub async fn execute_ddl(
         &self,
         db_config: &DbConfig,
@@ -1132,13 +1368,16 @@ impl DdlConverter {
         target_db: &str,
         progress_map: Option<&Arc<Mutex<HashMap<String, SchemaInitProgress>>>>,
     ) -> Result<String, String> {
+        let latest_diff = self.scan_schema_diff(db_config, target_db).await?;
+        if latest_diff.executable_change_count == 0 {
+            return Ok("数据库结构已是最新".to_string());
+        }
+
         log::info!("execute_ddl: 开始读取 {} 的表结构和索引文件", target_db);
-        let (tables_sql, indexes_sql) = self.read_schema_files(target_db)?;
+        let (tables_sql, _) = self.read_schema_files(target_db)?;
         log::info!("execute_ddl: 解析表定义...");
         let tables = self.parse_tables(&tables_sql)?;
         log::info!("execute_ddl: 共解析 {} 张表", tables.len());
-        let indexes = self.parse_indexes(&indexes_sql);
-        log::info!("execute_ddl: 共解析 {} 个索引", indexes.len());
 
         log::info!("execute_ddl: 创建数据库连接...");
         let conn = crate::db::create_connection(db_config).await?;
@@ -1152,7 +1391,6 @@ impl DdlConverter {
         let mut total_created_tables = 0;
         let mut total_added_columns = 0;
         let mut total_modified_columns = 0;
-        let mut total_indexes = 0;
 
         if matches!(db_config.db_type, DbType::MySQL) {
             let mut schemas: Vec<String> = tables
@@ -1176,8 +1414,7 @@ impl DdlConverter {
         }
 
         // 达梦/Oracle：确保目标 schema（用户）存在，不存在则创建
-        if matches!(db_config.db_type, DbType::DM) || matches!(db_config.db_type, DbType::Oracle)
-        {
+        if matches!(db_config.db_type, DbType::DM) || matches!(db_config.db_type, DbType::Oracle) {
             let mut schemas: Vec<String> = tables
                 .iter()
                 .map(|table| table.schema.to_uppercase())
@@ -1241,7 +1478,11 @@ impl DdlConverter {
                 table_name: table.table_name.clone(),
             };
 
-            log::info!("execute_ddl: 检查表 {}.{} 是否存在", table.schema, table.table_name);
+            log::info!(
+                "execute_ddl: 检查表 {}.{} 是否存在",
+                table.schema,
+                table.table_name
+            );
             let table_is_new = !conn.schema_table_exists(&table_id).await?;
             log::info!(
                 "execute_ddl: 表 {}.{} 是否为新表: {}",
@@ -1253,18 +1494,13 @@ impl DdlConverter {
                 let ddl = Self::generate_create_table(table, &db_config.db_type);
                 log::info!(
                     "execute_ddl: 准备创建表 {}.{}",
-                    table.schema, table.table_name
+                    table.schema,
+                    table.table_name
                 );
-                results.push(format!(
-                    "  ▶ 创建表 {}.{}",
-                    table.schema, table.table_name
-                ));
+                results.push(format!("  ▶ 创建表 {}.{}", table.schema, table.table_name));
                 results.push(format!("    SQL: {}", ddl));
-                let column_names: Vec<String> = table
-                    .columns
-                    .iter()
-                    .map(|c| c.name.clone())
-                    .collect();
+                let column_names: Vec<String> =
+                    table.columns.iter().map(|c| c.name.clone()).collect();
                 results.push(format!(
                     "    字段({}): {}",
                     column_names.len(),
@@ -1307,18 +1543,11 @@ impl DdlConverter {
                             match conn.execute_raw_sql(&ddl).await {
                                 Ok(_) => {
                                     total_added_columns += 1;
-                                    results.push(format!(
-                                        "    ✓ 新增字段 {} 成功",
-                                        column.name
-                                    ));
+                                    results.push(format!("    ✓ 新增字段 {} 成功", column.name));
                                 }
-                                Err(e)
-                                    if is_column_already_exists_error(&e) =>
-                                {
-                                    results.push(format!(
-                                        "    ⚠ 字段 {} 已存在，跳过",
-                                        column.name
-                                    ));
+                                Err(e) if is_column_already_exists_error(&e) => {
+                                    results
+                                        .push(format!("    ⚠ 字段 {} 已存在，跳过", column.name));
                                 }
                                 Err(e) => {
                                     results.push(format!(
@@ -1329,22 +1558,24 @@ impl DdlConverter {
                             }
                         }
                         Some(existing) if should_expand_column(existing, column) => {
-                            let ddl = Self::generate_modify_column(table, column, &db_config.db_type);
+                            let ddl =
+                                Self::generate_modify_column(table, column, &db_config.db_type);
                             let old_type_display = format_existing_column_type(existing);
-                            let new_type = Self::map_oracle_type(&column.data_type, &db_config.db_type);
+                            let new_type =
+                                Self::map_oracle_type(&column.data_type, &db_config.db_type);
                             results.push(format!(
                                 "  ▶ 表 {}.{} 扩容字段 {} ({} → {})",
-                                table.schema, table.table_name, column.name,
-                                old_type_display, new_type
+                                table.schema,
+                                table.table_name,
+                                column.name,
+                                old_type_display,
+                                new_type
                             ));
                             results.push(format!("    SQL: {}", ddl));
                             match conn.execute_raw_sql(&ddl).await {
                                 Ok(_) => {
                                     total_modified_columns += 1;
-                                    results.push(format!(
-                                        "    ✓ 扩容字段 {} 成功",
-                                        column.name
-                                    ));
+                                    results.push(format!("    ✓ 扩容字段 {} 成功", column.name));
                                 }
                                 Err(e) => {
                                     results.push(format!(
@@ -1363,7 +1594,9 @@ impl DdlConverter {
             if let Some(expected_comment) = &table.comment {
                 if !expected_comment.is_empty() {
                     let existing_comment = conn.get_table_comment(&table_id).await.unwrap_or(None);
-                    let comment_changed = existing_comment.as_deref() != Some(expected_comment.as_str());
+                    let comment_changed = !existing_comment
+                        .as_deref()
+                        .is_some_and(|current| comments_equal(current, expected_comment));
 
                     if comment_changed {
                         if let Some(table_comment_ddl) =
@@ -1371,7 +1604,8 @@ impl DdlConverter {
                         {
                             results.push(format!(
                                 "  ▶ 表注释 {}.{}: {} → {}",
-                                table.schema, table.table_name,
+                                table.schema,
+                                table.table_name,
                                 existing_comment.as_deref().unwrap_or("(无)"),
                                 expected_comment
                             ));
@@ -1397,7 +1631,10 @@ impl DdlConverter {
 
             // 执行字段注释
             if !table.column_comments.is_empty() {
-                let existing_comments = conn.get_column_comments(&table_id).await.unwrap_or_default();
+                let existing_comments = conn
+                    .get_column_comments(&table_id)
+                    .await
+                    .unwrap_or_default();
                 let mut changed_count = 0usize;
                 let mut success_count = 0usize;
 
@@ -1409,18 +1646,29 @@ impl DdlConverter {
                         .iter()
                         .find(|(name, _)| name.eq_ignore_ascii_case(col_name))
                         .map(|(_, c)| c.as_str());
-                    let comment_changed = existing != Some(expected_comment.as_str());
+                    let comment_changed = !existing
+                        .is_some_and(|current| comments_equal(current, expected_comment));
 
                     if comment_changed {
                         changed_count += 1;
                         // 找到该列定义
-                        if let Some(col_def) = table.columns.iter().find(|c| c.name.eq_ignore_ascii_case(col_name)) {
+                        if let Some(col_def) = table
+                            .columns
+                            .iter()
+                            .find(|c| c.name.eq_ignore_ascii_case(col_name))
+                        {
                             let ddl = Self::generate_single_column_comment_ddl(
-                                table, col_def, col_name, expected_comment, &db_config.db_type,
+                                table,
+                                col_def,
+                                col_name,
+                                expected_comment,
+                                &db_config.db_type,
                             );
                             results.push(format!(
                                 "  ▶ 字段注释 {}.{}.{}: {} → {}",
-                                table.schema, table.table_name, col_name,
+                                table.schema,
+                                table.table_name,
+                                col_name,
                                 existing.unwrap_or("(无)"),
                                 expected_comment
                             ));
@@ -1483,172 +1731,10 @@ impl DdlConverter {
             }
         }
 
-        // 按表分组处理索引（新增/修改/删除）
-        log::info!("execute_ddl: 开始处理索引...");
-        let tables_in_schema: Vec<&TableDef> = tables.iter().collect();
-        let mut table_indexes: HashMap<(&str, &str), Vec<&IndexDef>> = HashMap::new();
-        for index in &indexes {
-            let key = (index.schema.as_str(), index.table_name.as_str());
-            table_indexes.entry(key).or_default().push(index);
-        }
-
-        for table in &tables_in_schema {
-            let table_id = TableIdentifier {
-                schema: table.schema.clone(),
-                table_name: table.table_name.clone(),
-            };
-
-            let existing_indexes = match conn.get_indexes(&table_id).await {
-                Ok(value) => value,
-                Err(e) => {
-                    results.push(format!(
-                        "  ✗ 查询表 {}.{} 索引失败: {}",
-                        table.schema, table.table_name, e
-                    ));
-                    continue;
-                }
-            };
-
-            let key = (table.schema.as_str(), table.table_name.as_str());
-            let expected_indexes = table_indexes.get(&key).map(|v| v.as_slice()).unwrap_or(&[]);
-
-            // 1. 删除多余的索引（数据库中存在但 DDL 中没有的）
-            for existing in &existing_indexes {
-                // 跳过主键索引
-                if existing.name.eq_ignore_ascii_case("PRIMARY") {
-                    continue;
-                }
-                let still_needed = expected_indexes.iter().any(|expected| {
-                    expected.index_name.eq_ignore_ascii_case(&existing.name)
-                });
-                if !still_needed {
-                    let drop_ddl = match &db_config.db_type {
-                        DbType::MySQL => format!(
-                            "DROP INDEX `{}` ON {};",
-                            existing.name.to_lowercase(),
-                            Self::format_table_name(&table.schema, &table.table_name, &db_config.db_type)
-                        ),
-                        DbType::PostgreSQL => format!(
-                            "DROP INDEX IF EXISTS \"{}\".\"{}\";",
-                            table.schema.to_lowercase(),
-                            existing.name.to_lowercase()
-                        ),
-                        _ => format!(
-                            "DROP INDEX \"{}\".\"{}\";",
-                            table.schema.to_uppercase(),
-                            existing.name.to_uppercase()
-                        ),
-                    };
-                    results.push(format!(
-                        "  ▶ 删除多余索引 {} (列: {})",
-                        existing.name,
-                        existing.columns.join(", ")
-                    ));
-                    results.push(format!("    SQL: {}", drop_ddl));
-                    match conn.execute_raw_sql(&drop_ddl).await {
-                        Ok(_) => {
-                            total_indexes += 1;
-                            results.push(format!("    ✓ 索引 {} 已删除", existing.name));
-                        }
-                        Err(e) => {
-                            results.push(format!("    ✗ 删除索引 {} 失败: {}", existing.name, e));
-                        }
-                    }
-                }
-            }
-
-            // 2. 新增或修改索引
-            for index in expected_indexes {
-                let existing_same_name = existing_indexes
-                    .iter()
-                    .find(|ei| ei.name.eq_ignore_ascii_case(&index.index_name));
-
-                let existing_same_columns = existing_indexes
-                    .iter()
-                    .find(|ei| same_columns(&ei.columns, &index.columns)
-                        && !ei.name.eq_ignore_ascii_case(&index.index_name));
-
-                // 同名索引但列不同 → 删除旧索引后重建
-                if let Some(old_index) = existing_same_name {
-                    if !same_columns(&old_index.columns, &index.columns) {
-                        let drop_ddl = match &db_config.db_type {
-                            DbType::MySQL => format!(
-                                "DROP INDEX `{}` ON {};",
-                                old_index.name.to_lowercase(),
-                                Self::format_table_name(&table.schema, &table.table_name, &db_config.db_type)
-                            ),
-                            DbType::PostgreSQL => format!(
-                                "DROP INDEX IF EXISTS \"{}\".\"{}\";",
-                                table.schema.to_lowercase(),
-                                old_index.name.to_lowercase()
-                            ),
-                            _ => format!(
-                                "DROP INDEX \"{}\".\"{}\";",
-                                table.schema.to_uppercase(),
-                                old_index.name.to_uppercase()
-                            ),
-                        };
-                        results.push(format!(
-                            "  ▶ 修改索引 {}: 列 {} → {}",
-                            index.index_name,
-                            old_index.columns.join(", "),
-                            index.columns.join(", ")
-                        ));
-                        results.push(format!("    SQL: {}", drop_ddl));
-                        match conn.execute_raw_sql(&drop_ddl).await {
-                            Ok(_) => {
-                                results.push(format!("    ✓ 旧索引 {} 已删除", index.index_name));
-                            }
-                            Err(e) => {
-                                results.push(format!(
-                                    "    ✗ 删除旧索引 {} 失败: {}",
-                                    index.index_name, e
-                                ));
-                                continue;
-                            }
-                        }
-                        // 继续创建新索引（走下面的创建逻辑）
-                    } else {
-                        // 同名同列，索引已存在且未变，跳过
-                        continue;
-                    }
-                } else if existing_same_columns.is_some() {
-                    // 不同名但同列，索引已存在，跳过
-                    continue;
-                }
-
-                // 创建索引
-                let Some(ddl) =
-                    Self::generate_create_index_for_table(index, Some(table), &db_config.db_type)
-                else {
-                    results.push(format!(
-                        "  ↷ 索引 {} 跳过: MySQL 暂不支持 Oracle 函数表达式索引",
-                        index.index_name
-                    ));
-                    continue;
-                };
-                results.push(format!(
-                    "  ▶ 创建索引 {} (列: {})",
-                    index.index_name,
-                    index.columns.join(", ")
-                ));
-                results.push(format!("    SQL: {}", ddl));
-                match conn.execute_raw_sql(&ddl).await {
-                    Ok(_) => {
-                        total_indexes += 1;
-                        results.push(format!("    ✓ 索引 {} 创建成功", index.index_name));
-                    }
-                    Err(e) => {
-                        results.push(format!("    ✗ 索引 {} 创建失败: {}", index.index_name, e));
-                    }
-                }
-            }
-        }
-
         log::info!("execute_ddl: {} 处理完成", target_db);
         results.push(format!(
-            "初始化完成：创建 {} 张表，新增 {} 个字段，扩容 {} 个字段，新增/修改 {} 个索引",
-            total_created_tables, total_added_columns, total_modified_columns, total_indexes
+            "初始化完成：创建 {} 张表，新增 {} 个字段，扩容 {} 个字段",
+            total_created_tables, total_added_columns, total_modified_columns
         ));
 
         Ok(results.join("\n"))
@@ -1791,7 +1877,11 @@ fn estimate_fixed_column_bytes(mysql_type: &str) -> u32 {
         2
     } else if upper.starts_with("INT") || upper.starts_with("FLOAT") {
         4
-    } else if upper.starts_with("BIGINT") || upper.starts_with("DOUBLE") || upper.starts_with("DATETIME") || upper.starts_with("TIMESTAMP") {
+    } else if upper.starts_with("BIGINT")
+        || upper.starts_with("DOUBLE")
+        || upper.starts_with("DATETIME")
+        || upper.starts_with("TIMESTAMP")
+    {
         8
     } else if upper.starts_with("DECIMAL") || upper.starts_with("NUMERIC") {
         // DECIMAL 在索引中通常按实际精度，保守估计 16
@@ -1821,7 +1911,10 @@ fn format_existing_column_type(existing: &ColumnInfo) -> String {
         } else if upper.starts_with("TEXT") || upper.starts_with("BLOB") {
             // TEXT/BLOB 不需要显示长度，直接返回
             upper.to_string()
-        } else if upper.starts_with("DECIMAL") || upper.starts_with("NUMERIC") || upper.starts_with("NUMBER") {
+        } else if upper.starts_with("DECIMAL")
+            || upper.starts_with("NUMERIC")
+            || upper.starts_with("NUMBER")
+        {
             if let Some(p) = existing.data_precision {
                 if let Some(s) = existing.data_scale {
                     format!("{}({}, {})", upper, p, s)
@@ -2020,6 +2113,5 @@ fn is_column_already_exists_error(error: &str) -> bool {
     lower.contains("已存在")
         || lower.contains("already exists")
         || lower.contains("duplicate column")
-        || lower.contains("duplicate")
-        && lower.contains("column")
+        || lower.contains("duplicate") && lower.contains("column")
 }
