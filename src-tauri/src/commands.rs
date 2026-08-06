@@ -1,7 +1,7 @@
 use crate::config_store;
 use crate::csv_parser;
 use crate::db::{self, DbConnection, DbValue};
-use crate::ddl_converter::DdlConverter;
+use crate::ddl_converter::{build_schema_diff_report, DdlConverter};
 use crate::models::*;
 use csv::ReaderBuilder;
 use std::collections::HashMap;
@@ -656,10 +656,7 @@ fn with_mysql_duplicate_key_update(sql: &str) -> String {
         .collect::<Vec<_>>()
         .join(", ");
 
-    format!(
-        "{} ON DUPLICATE KEY UPDATE {}",
-        trimmed, assignments
-    )
+    format!("{} ON DUPLICATE KEY UPDATE {}", trimmed, assignments)
 }
 
 /// 在 SQL 大写文本中查找关键字，确保匹配的是独立关键字而非表名/列名的一部分。
@@ -669,10 +666,10 @@ pub fn find_sql_keyword(upper: &str, keyword: &str) -> Option<usize> {
     let kw_len = keyword.len();
     while let Some(pos) = upper[start..].find(keyword) {
         let abs_pos = start + pos;
-    let before_ok = abs_pos == 0 || {
-        let c = upper.as_bytes()[abs_pos - 1];
-        c.is_ascii_whitespace() || c == b')' || c == b'`' || c == b'('
-    };
+        let before_ok = abs_pos == 0 || {
+            let c = upper.as_bytes()[abs_pos - 1];
+            c.is_ascii_whitespace() || c == b')' || c == b'`' || c == b'('
+        };
         let after_idx = abs_pos + kw_len;
         let after_ok = after_idx >= upper.len() || {
             let c = upper.as_bytes()[after_idx];
@@ -729,10 +726,7 @@ fn ensure_mysql_target_db(sql: &str, target_db: &str) -> String {
         ("UPDATE ", "UPDATE ".len()),
     ];
 
-    let (keyword, prefix_len) = match dml_prefixes
-        .iter()
-        .find(|(kw, _)| upper.starts_with(kw))
-    {
+    let (keyword, prefix_len) = match dml_prefixes.iter().find(|(kw, _)| upper.starts_with(kw)) {
         Some((kw, len)) => (kw.to_string(), *len),
         None => return trimmed.to_string(),
     };
@@ -763,12 +757,7 @@ fn ensure_mysql_target_db(sql: &str, target_db: &str) -> String {
         return trimmed.to_string();
     }
 
-    format!(
-        "{}`{}`.{}",
-        keyword,
-        target_db.to_lowercase(),
-        after_prefix
-    )
+    format!("{}`{}`.{}", keyword, target_db.to_lowercase(), after_prefix)
 }
 
 pub fn read_csv_data(file_path: &str) -> Result<CsvData, String> {
@@ -839,6 +828,53 @@ fn update_progress(
 pub fn list_schema_targets(schema_dir: String) -> Result<Vec<SchemaTarget>, String> {
     let converter = DdlConverter::new(PathBuf::from(schema_dir));
     converter.list_schema_targets()
+}
+
+/// 并发扫描全部业务库的结构差异。
+#[tauri::command]
+pub async fn scan_schema_diffs(
+    state: State<'_, AppState>,
+    db_config_id: String,
+    schema_dir: String,
+) -> Result<SchemaDiffReport, String> {
+    let db_config = {
+        let configs = state.db_configs.lock().map_err(|e| e.to_string())?;
+        configs
+            .iter()
+            .find(|config| config.id == db_config_id)
+            .cloned()
+            .ok_or_else(|| "未找到数据库配置".to_string())?
+    };
+    let converter = DdlConverter::new(PathBuf::from(&schema_dir));
+    let targets = converter.list_schema_targets()?;
+    let mut tasks = tokio::task::JoinSet::new();
+
+    for target in targets {
+        let config = db_config.clone();
+        let target_db = target.target_db;
+        let schema_path = PathBuf::from(&schema_dir);
+        tasks.spawn(async move {
+            let converter = DdlConverter::new(schema_path);
+            let result = converter.scan_schema_diff(&config, &target_db).await;
+            match result {
+                Ok(diff) => diff,
+                Err(error) => SchemaDbDiff {
+                    target_db,
+                    tables: Vec::new(),
+                    warnings: Vec::new(),
+                    error: Some(error),
+                    executable_change_count: 0,
+                },
+            }
+        });
+    }
+
+    let mut databases = Vec::new();
+    while let Some(result) = tasks.join_next().await {
+        databases.push(result.map_err(|error| format!("结构扫描任务失败: {}", error))?);
+    }
+    databases.sort_by(|left, right| left.target_db.cmp(&right.target_db));
+    Ok(build_schema_diff_report(databases))
 }
 
 /// 初始化数据库表结构（从 Oracle DDL 转换并执行）
@@ -1056,4 +1092,3 @@ fn emit_schema_log(app_handle: &tauri::AppHandle, message: &str) {
     log::info!("[schema] {}", message);
     let _ = app_handle.emit("schema-log", message.to_string());
 }
-

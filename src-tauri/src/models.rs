@@ -86,6 +86,59 @@ pub struct SchemaTarget {
     pub indexes_file: String,
 }
 
+/// Schema 结构变更类型。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SchemaChangeKind {
+    CreateTable,
+    AddColumn,
+    ExpandColumn,
+    UpdateTableComment,
+    UpdateColumnComment,
+}
+
+/// 单项 Schema 结构差异。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SchemaChange {
+    pub kind: SchemaChangeKind,
+    pub object_name: String,
+    pub current: Option<String>,
+    pub target: Option<String>,
+    pub executable: bool,
+}
+
+/// 单表结构差异。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TableDiff {
+    pub schema: String,
+    pub table_name: String,
+    pub is_new_table: bool,
+    pub new_table_columns: Vec<String>,
+    pub changes: Vec<SchemaChange>,
+    pub executable_change_count: usize,
+}
+
+/// 单库结构扫描结果。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SchemaDbDiff {
+    pub target_db: String,
+    pub tables: Vec<TableDiff>,
+    pub warnings: Vec<String>,
+    pub error: Option<String>,
+    pub executable_change_count: usize,
+}
+
+/// 全部库的结构扫描结果。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct SchemaDiffReport {
+    pub databases: Vec<SchemaDbDiff>,
+    pub database_count: usize,
+    pub new_table_count: usize,
+    pub field_change_count: usize,
+    pub comment_change_count: usize,
+    pub executable_change_count: usize,
+    pub has_errors: bool,
+}
+
 /// 表字段及注释信息（用于前端展示）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ColumnWithComment {
@@ -166,7 +219,7 @@ pub struct DbConfig {
     pub port: u16,
     pub username: String,
     pub password: String,
-    pub database: String,     // PG的数据库名 / Oracle的ServiceName或SID / DM的schema
+    pub database: String, // PG的数据库名 / Oracle的ServiceName或SID / DM的schema
     #[serde(default)]
     pub oracle_connection_mode: OracleConnectionMode,
     pub extra_params: String, // 额外连接参数

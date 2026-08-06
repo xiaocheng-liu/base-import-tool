@@ -1,7 +1,122 @@
-use base_import_tool_lib::ddl_converter::{should_expand_column, ColumnDef, DdlConverter, IndexDef, TableDef};
-use base_import_tool_lib::models::{ColumnInfo, DbType};
+use base_import_tool_lib::ddl_converter::{
+    build_schema_diff_report, build_table_diff, comments_equal, should_expand_column, ColumnDef,
+    DdlConverter, ExistingTableSchema, IndexDef, TableDef,
+};
+use base_import_tool_lib::models::{ColumnInfo, DbType, SchemaChangeKind, SchemaDbDiff};
 use std::collections::HashMap;
 use std::fs;
+
+fn schema_table() -> TableDef {
+    TableDef {
+        schema: "CBS".to_string(),
+        table_name: "PATIENT".to_string(),
+        columns: vec![
+            ColumnDef {
+                name: "NAME".to_string(),
+                data_type: "VARCHAR2(50)".to_string(),
+                nullable: true,
+                default_value: None,
+            },
+            ColumnDef {
+                name: "MOBILE".to_string(),
+                data_type: "VARCHAR2(20)".to_string(),
+                nullable: true,
+                default_value: None,
+            },
+        ],
+        primary_key: Vec::new(),
+        comment: Some("患者信息".to_string()),
+        column_comments: HashMap::from([
+            ("NAME".to_string(), "姓名".to_string()),
+            ("MOBILE".to_string(), "手机号".to_string()),
+        ]),
+    }
+}
+
+#[test]
+fn plans_new_table_as_one_executable_change() {
+    let diff = build_table_diff(&schema_table(), None, &DbType::Oracle);
+
+    assert!(diff.is_new_table);
+    assert_eq!(diff.changes.len(), 1);
+    assert_eq!(diff.changes[0].kind, SchemaChangeKind::CreateTable);
+    assert!(diff.changes[0].executable);
+    assert_eq!(
+        diff.changes[0].target.as_deref(),
+        Some("2 个字段")
+    );
+    assert_eq!(diff.new_table_columns, vec!["NAME", "MOBILE"]);
+}
+
+#[test]
+fn summarizes_schema_differences_and_partial_failures() {
+    let table_diff = build_table_diff(&schema_table(), None, &DbType::Oracle);
+    let report = build_schema_diff_report(vec![
+        SchemaDbDiff {
+            target_db: "cbs".to_string(),
+            tables: vec![table_diff],
+            warnings: Vec::new(),
+            error: None,
+            executable_change_count: 1,
+        },
+        SchemaDbDiff {
+            target_db: "his".to_string(),
+            tables: Vec::new(),
+            warnings: Vec::new(),
+            error: Some("连接失败".to_string()),
+            executable_change_count: 0,
+        },
+    ]);
+
+    assert_eq!(report.database_count, 2);
+    assert_eq!(report.new_table_count, 1);
+    assert_eq!(report.executable_change_count, 1);
+    assert!(report.has_errors);
+}
+
+#[test]
+fn plans_column_and_comment_differences() {
+    let existing = ExistingTableSchema {
+        columns: vec![ColumnInfo {
+            name: "NAME".to_string(),
+            data_type: "VARCHAR2".to_string(),
+            data_length: Some(20),
+            data_precision: None,
+            data_scale: None,
+        }],
+        table_comment: Some("旧注释".to_string()),
+        column_comments: HashMap::from([("NAME".to_string(), "旧姓名".to_string())]),
+    };
+
+    let diff = build_table_diff(&schema_table(), Some(&existing), &DbType::Oracle);
+    let kinds: Vec<SchemaChangeKind> = diff.changes.iter().map(|item| item.kind.clone()).collect();
+
+    assert_eq!(
+        kinds,
+        vec![
+            SchemaChangeKind::AddColumn,
+            SchemaChangeKind::ExpandColumn,
+            SchemaChangeKind::UpdateTableComment,
+            SchemaChangeKind::UpdateColumnComment,
+            SchemaChangeKind::UpdateColumnComment,
+        ]
+    );
+}
+
+#[test]
+fn treats_comment_formatting_whitespace_as_equal() {
+    assert!(comments_equal("药品2的生产厂家 ", "药品2的生产厂家"));
+    assert!(comments_equal(" 药学诊察建议", "药学诊察建议"));
+    assert!(comments_equal(
+        "状态，1、状态 = 草稿\n\n2、状态 = 已提交",
+        "状态，1、状态 = 草稿 2、状态 = 已提交"
+    ));
+}
+
+#[test]
+fn detects_real_comment_text_changes() {
+    assert!(!comments_equal("药学诊察建议", "药学诊察内容"));
+}
 
 #[test]
 fn lists_schema_targets_from_tables_and_indexes_files() {
@@ -249,12 +364,8 @@ fn adds_mysql_prefix_length_for_text_index_columns() {
         columns: vec!["HIS_NAME".to_string()],
     };
 
-    let ddl = DdlConverter::generate_create_index_for_table(
-        &index,
-        Some(&table),
-        &DbType::MySQL,
-    )
-    .unwrap();
+    let ddl = DdlConverter::generate_create_index_for_table(&index, Some(&table), &DbType::MySQL)
+        .unwrap();
 
     assert_eq!(
         ddl,
@@ -325,19 +436,11 @@ fn formats_mysql_defaults_for_oracle_specific_values() {
         ""
     );
     assert_eq!(
-        DdlConverter::format_default_value(
-            "TEXT",
-            &Some("''".to_string()),
-            &DbType::MySQL,
-        ),
+        DdlConverter::format_default_value("TEXT", &Some("''".to_string()), &DbType::MySQL,),
         ""
     );
     assert_eq!(
-        DdlConverter::format_default_value(
-            "TINYINT",
-            &Some("''".to_string()),
-            &DbType::MySQL,
-        ),
+        DdlConverter::format_default_value("TINYINT", &Some("''".to_string()), &DbType::MySQL,),
         ""
     );
     assert_eq!(
@@ -349,11 +452,7 @@ fn formats_mysql_defaults_for_oracle_specific_values() {
         " DEFAULT CURRENT_TIMESTAMP"
     );
     assert_eq!(
-        DdlConverter::format_default_value(
-            "DATETIME",
-            &Some("''".to_string()),
-            &DbType::MySQL,
-        ),
+        DdlConverter::format_default_value("DATETIME", &Some("''".to_string()), &DbType::MySQL,),
         ""
     );
 }
@@ -406,10 +505,8 @@ CREATE TABLE "INPT"."MEDICATION_REASON"
         )
         .unwrap();
 
-    let first_ddl =
-        DdlConverter::generate_create_table(&tables[0], &DbType::MySQL);
-    let second_ddl =
-        DdlConverter::generate_create_table(&tables[1], &DbType::MySQL);
+    let first_ddl = DdlConverter::generate_create_table(&tables[0], &DbType::MySQL);
+    let second_ddl = DdlConverter::generate_create_table(&tables[1], &DbType::MySQL);
 
     assert!(first_ddl.contains("`create_time` DATETIME"));
     assert!(!first_ddl.contains("DEFAULT ''"));

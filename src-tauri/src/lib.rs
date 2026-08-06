@@ -111,6 +111,7 @@ pub fn run() {
             commands::start_import,
             commands::get_import_progress,
             commands::list_schema_targets,
+            commands::scan_schema_diffs,
             commands::init_schema,
             commands::init_all_schemas,
             commands::get_schema_init_progress,

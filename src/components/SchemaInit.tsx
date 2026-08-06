@@ -1,5 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import type { DbConfig, SchemaTarget, SchemaInitProgress } from '../types';
+import type {
+  DbConfig,
+  SchemaChangeKind,
+  SchemaDiffReport,
+  SchemaInitProgress,
+  SchemaTarget,
+} from '../types';
 
 interface Props {
   dbConfigs: DbConfig[];
@@ -34,6 +40,10 @@ export default function SchemaInit({ dbConfigs, selectedDbConfigId }: Props) {
   const [schemaTargets, setSchemaTargets] = useState<SchemaTarget[]>([]);
   const [schemaFolderPath, setSchemaFolderPath] = useState('');
   const [loading, setLoading] = useState(false);
+  const [scanning, setScanning] = useState(false);
+  const [diffReport, setDiffReport] = useState<SchemaDiffReport | null>(null);
+  const [expandedDiffDbs, setExpandedDiffDbs] = useState<Record<string, boolean>>({});
+  const [expandedDiffTables, setExpandedDiffTables] = useState<Record<string, boolean>>({});
   const [initializing, setInitializing] = useState(false);
   const [loadError, setLoadError] = useState('');
   const [globalLogs, setGlobalLogs] = useState<string[]>([]);
@@ -51,6 +61,12 @@ export default function SchemaInit({ dbConfigs, selectedDbConfigId }: Props) {
   const selectedConfig = dbConfigs.find((c) => c.id === selectedDbConfigId);
 
   useEffect(() => {
+    setDiffReport(null);
+    setExpandedDiffDbs({});
+    setExpandedDiffTables({});
+  }, [selectedDbConfigId]);
+
+  useEffect(() => {
     if (!schemaFolderPath) return;
 
     const loadSchemaTargets = async () => {
@@ -63,6 +79,7 @@ export default function SchemaInit({ dbConfigs, selectedDbConfigId }: Props) {
           schemaDir: schemaFolderPath,
         });
         setSchemaTargets(targets);
+        setDiffReport(null);
       } catch (e: any) {
         setLoadError(`读取初始化脚本失败: ${e}`);
         setSchemaTargets([]);
@@ -88,6 +105,9 @@ export default function SchemaInit({ dbConfigs, selectedDbConfigId }: Props) {
         setGlobalLogs([]);
         setDbLogs({});
         setExpandedDbs({});
+        setDiffReport(null);
+        setExpandedDiffDbs({});
+        setExpandedDiffTables({});
       }
     } catch (e: any) {
       setLoadError(`选择 Schema 文件夹失败: ${e}`);
@@ -106,7 +126,36 @@ export default function SchemaInit({ dbConfigs, selectedDbConfigId }: Props) {
     setDbLogs({});
     setProgressMap({});
     setExpandedDbs({});
+    setDiffReport(null);
+    setExpandedDiffDbs({});
+    setExpandedDiffTables({});
+    setScanning(false);
     setInitializing(false);
+  };
+
+  const handleScanDiffs = async () => {
+    if (!selectedConfig || !schemaFolderPath || schemaTargets.length === 0) return;
+    setScanning(true);
+    setLoadError('');
+    setDiffReport(null);
+    try {
+      const { invoke } = await import('@tauri-apps/api/core');
+      const report: SchemaDiffReport = await invoke('scan_schema_diffs', {
+        dbConfigId: selectedConfig.id,
+        schemaDir: schemaFolderPath,
+      });
+      setDiffReport(report);
+      const expanded: Record<string, boolean> = {};
+      for (const database of report.databases) {
+        expanded[database.target_db.toLowerCase()] =
+          database.error !== null || database.tables.length > 0 || database.warnings.length > 0;
+      }
+      setExpandedDiffDbs(expanded);
+    } catch (e: any) {
+      setLoadError(`扫描结构差异失败: ${e}`);
+    } finally {
+      setScanning(false);
+    }
   };
 
   const appendDbLogs = (lines: string[]) => {
@@ -193,9 +242,10 @@ export default function SchemaInit({ dbConfigs, selectedDbConfigId }: Props) {
               }
               unlistenLog();
               setInitializing(false);
+              setDiffReport(null);
             }, 300);
           }
-        } catch (_) {
+        } catch {
           // 轮询失败静默处理
         }
       };
@@ -221,6 +271,17 @@ export default function SchemaInit({ dbConfigs, selectedDbConfigId }: Props) {
 
   const toggleDb = (db: string) => {
     setExpandedDbs((prev) => ({ ...prev, [db]: !prev[db] }));
+  };
+
+  const changeLabel = (kind: SchemaChangeKind) => {
+    const labels: Record<SchemaChangeKind, string> = {
+      CreateTable: '新增表',
+      AddColumn: '新增字段',
+      ExpandColumn: '扩容字段',
+      UpdateTableComment: '表注释',
+      UpdateColumnComment: '字段注释',
+    };
+    return labels[kind];
   };
 
   const copyDbLogs = (db: string) => {
@@ -342,9 +403,113 @@ export default function SchemaInit({ dbConfigs, selectedDbConfigId }: Props) {
             </button>
           </>
         )}
+        {schemaFolderPath && schemaTargets.length > 0 && (
+          <button
+            className="btn btn-secondary"
+            onClick={handleScanDiffs}
+            disabled={loading || scanning || initializing}
+          >
+            {scanning ? '扫描中...' : '扫描结构差异'}
+          </button>
+        )}
       </div>
 
-      {schemaTargets.length > 0 && (
+      {diffReport && (
+        <div className="schema-diff-section">
+          <div className="schema-diff-summary">
+            <span><strong>{diffReport.database_count}</strong> 个库</span>
+            <span><strong>{diffReport.new_table_count}</strong> 张新表</span>
+            <span><strong>{diffReport.field_change_count}</strong> 个字段</span>
+            <span><strong>{diffReport.comment_change_count}</strong> 个注释</span>
+          </div>
+          <div className="schema-diff-list">
+            {diffReport.databases.map((database) => {
+              const dbKey = database.target_db.toLowerCase();
+              const expanded = !!expandedDiffDbs[dbKey];
+              const consistent =
+                !database.error && database.tables.length === 0 && database.warnings.length === 0;
+              return (
+                <div
+                  key={dbKey}
+                  className={`schema-diff-db ${database.error ? 'schema-diff-error' : consistent ? 'schema-diff-consistent' : ''}`}
+                >
+                  <button
+                    type="button"
+                    className="schema-diff-db-header"
+                    onClick={() => setExpandedDiffDbs((prev) => ({ ...prev, [dbKey]: !prev[dbKey] }))}
+                  >
+                    <span className="schema-module-toggle">{expanded ? '▼' : '▶'}</span>
+                    <strong>{database.target_db.toUpperCase()}</strong>
+                    <span className="schema-diff-status">
+                      {database.error
+                        ? '扫描失败'
+                        : consistent
+                          ? '结构一致'
+                          : database.executable_change_count > 0
+                            ? `${database.executable_change_count} 项变更`
+                            : '无可执行变更'}
+                    </span>
+                  </button>
+                  {expanded && (
+                    <div className="schema-diff-db-body">
+                      {database.error && <div className="schema-db-error">{database.error}</div>}
+                      {database.warnings.map((warning) => (
+                        <div key={warning} className="schema-diff-warning">{warning}</div>
+                      ))}
+                      {!database.error && database.tables.length === 0 && (
+                        <div className="schema-diff-empty">数据库结构与脚本一致</div>
+                      )}
+                      {database.tables.map((table) => {
+                        const tableKey = `${dbKey}.${table.schema}.${table.table_name}`;
+                        const tableExpanded = !!expandedDiffTables[tableKey];
+                        return (
+                          <div key={tableKey} className="schema-diff-table">
+                            <button
+                              type="button"
+                              className="schema-diff-table-header"
+                              onClick={() => setExpandedDiffTables((prev) => ({
+                                ...prev,
+                                [tableKey]: !prev[tableKey],
+                              }))}
+                            >
+                              <span>{tableExpanded ? '▼' : '▶'}</span>
+                              <strong>{table.schema}.{table.table_name}</strong>
+                              <span>{table.is_new_table ? '新增表' : `${table.changes.length} 项`}</span>
+                            </button>
+                            {tableExpanded && (
+                              <div className="schema-diff-items">
+                                {table.is_new_table && (
+                                  <>
+                                    <div className="schema-diff-detail">字段：{table.new_table_columns.join(', ') || '无'}</div>
+                                  </>
+                                )}
+                                {table.changes.map((change, index) => (
+                                  <div key={`${change.kind}-${change.object_name}-${index}`} className="schema-diff-item">
+                                    <span className={`schema-diff-kind schema-diff-kind-${change.kind.toLowerCase()}`}>
+                                      {changeLabel(change.kind)}
+                                    </span>
+                                    <strong>{change.object_name}</strong>
+                                    <span className="schema-diff-values">
+                                      {change.current ?? '(无)'} → {change.target ?? '(删除)'}
+                                    </span>
+                                  </div>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {schemaTargets.length > 0 &&
+        (initializing || globalLogs.length > 0 || Object.keys(progressMap).length > 0) && (
         <div className="schema-module-list">
           {schemaTargets.map((target) => {
             const dbKey = target.target_db.toLowerCase();
@@ -458,6 +623,10 @@ export default function SchemaInit({ dbConfigs, selectedDbConfigId }: Props) {
             !schemaFolderPath ||
             schemaTargets.length === 0 ||
             loading ||
+            scanning ||
+            !diffReport ||
+            diffReport.has_errors ||
+            diffReport.executable_change_count === 0 ||
             initializing
           }
         >
