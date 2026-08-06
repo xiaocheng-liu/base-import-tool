@@ -6,6 +6,7 @@ interface Props {
   setDbConfigs: (configs: DbConfig[]) => void;
   selectedDbConfigId: string;
   setSelectedDbConfigId: (id: string) => void;
+  onSaved: () => void;
 }
 
 const DB_TYPES: DbType[] = ['Oracle', 'DM', 'PostgreSQL', 'MySQL'];
@@ -34,6 +35,7 @@ export default function DbConfigManager({
   setDbConfigs,
   selectedDbConfigId,
   setSelectedDbConfigId,
+  onSaved,
 }: Props) {
   const existingConfig = dbConfigs.length > 0 ? dbConfigs[0] : null;
   const [editing, setEditing] = useState<DbConfig>(existingConfig || emptyConfig());
@@ -62,6 +64,7 @@ export default function DbConfigManager({
       setDbConfigs([saved]);
       setSelectedDbConfigId(saved.id);
       setTestResult(null);
+      onSaved();
     } catch (e: any) {
       setTestResult({ success: false, message: `保存失败: ${e}`, db_version: null });
     } finally {
