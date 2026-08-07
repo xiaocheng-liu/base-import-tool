@@ -32,6 +32,7 @@
   },
   "bundle": {
     "active": true,
+    "resources": ["resources/oracle-client-*/*"],
     "targets": ["app", "dmg", "msi", "nsis"],
     "icon": [
       "icons/32x32.png",
