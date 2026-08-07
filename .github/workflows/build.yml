@@ -56,9 +56,22 @@ jobs:
           $clientDir = "src-tauri\resources\oracle-client-windows"
           New-Item -ItemType Directory -Force -Path $clientDir | Out-Null
           Copy-Item -Path "${{ steps.oracle-windows.outputs.install-path }}\*" -Destination $clientDir -Recurse -Force
+
+          # Oracle 23 客户端依赖 VC++ 2015-2022 x64 运行库。
+          $runtimeDlls = @("VCRUNTIME140.dll", "VCRUNTIME140_1.dll", "MSVCP140.dll")
+          foreach ($runtimeDll in $runtimeDlls) {
+            $runtimePath = Join-Path $env:SystemRoot "System32\$runtimeDll"
+            if (Test-Path $runtimePath) {
+              Copy-Item -Path $runtimePath -Destination $clientDir -Force
+            }
+          }
+
           Write-Host "✓ Oracle Instant Client copied to $clientDir"
-          if (Test-Path "$clientDir\oci.dll") {
-            Write-Host "  oci.dll found"
+          foreach ($requiredDll in @("oci.dll", "VCRUNTIME140.dll")) {
+            if (-not (Test-Path "$clientDir\$requiredDll")) {
+              throw "Required Oracle runtime dependency is missing: $requiredDll"
+            }
+            Write-Host "  $requiredDll found"
           }
 
       - run: npm run build
